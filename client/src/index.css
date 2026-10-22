@@ -1,0 +1,161 @@
+:root {
+  /* Core Surfaces — Reference Pale Aqua & Crisp White Palette */
+  --bg-canvas: #ffffff;
+  --bg-aqua: #e6f2f2;
+  --bg-aqua-soft: #f2f8f8;
+  --bg-aqua-tint: #ebf5f5;
+  --bg-surface: #ffffff;
+  --bg-surface-subtle: #f7fbfb;
+
+  /* Deep Teal & Forest Surfaces (Leaderboard Panel & Footer) */
+  --teal-deep: #08343a;
+  --teal-footer: #07262b;
+  --teal-primary: #0b585f;
+  --teal-primary-hover: #08454b;
+  --teal-primary-active: #06373c;
+  --teal-soft: #d3efee;
+  --teal-soft-border: #b5e2e0;
+
+  /* Warm Amber Accent ("I lost something", "Campus Heroes", Rank Badges) */
+  --amber-primary: #f5a623;
+  --amber-primary-hover: #e39614;
+  --amber-soft: #fdeacc;
+  --amber-soft-border: #f7d49c;
+  --amber-text: #8a5000;
+
+  /* Typography Colors */
+  --text-primary: #092428;
+  --text-secondary: #3f5d61;
+  --text-muted: #648185;
+  --text-on-teal: #ffffff;
+  --text-on-teal-muted: #b3cfd2;
+  --text-on-amber: #092428;
+
+  /* Borders & Dividers */
+  --border-subtle: #e1eded;
+  --border-default: #cfe2e2;
+  --border-strong: #adcaca;
+  --border-focus: #0b585f;
+
+  /* Semantic Status Colors */
+  --status-found-bg: #d3efee;
+  --status-found-text: #0b585f;
+  --status-lost-bg: #fdeacc;
+  --status-lost-text: #8a5000;
+
+  --status-open-bg: #e6f4f1;
+  --status-open-text: #0b585f;
+  --status-open-border: #bce3dc;
+
+  --status-matched-bg: #e0f2fe;
+  --status-matched-text: #0369a1;
+  --status-matched-border: #bae6fd;
+
+  --status-pending-bg: #fef3c7;
+  --status-pending-text: #92400e;
+  --status-pending-border: #fde68a;
+
+  --status-returned-bg: #dcfce7;
+  --status-returned-text: #166534;
+  --status-returned-border: #bbf7d0;
+
+  --status-closed-bg: #f1f5f5;
+  --status-closed-text: #4c6669;
+  --status-closed-border: #d5e2e2;
+
+  --status-danger-bg: #fef2f2;
+  --status-danger-text: #b91c1c;
+  --status-danger-border: #fecaca;
+
+  /* Shadows */
+  --shadow-xs: 0 1px 2px rgba(9, 36, 40, 0.04);
+  --shadow-sm: 0 2px 8px rgba(9, 36, 40, 0.05);
+  --shadow-md: 0 6px 18px rgba(9, 36, 40, 0.07);
+  --shadow-lg: 0 14px 32px rgba(9, 36, 40, 0.1);
+  --shadow-focus: 0 0 0 3px rgba(11, 88, 95, 0.22);
+
+  /* Radii & Layout */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-pill: 9999px;
+  --container-max: 1180px;
+  --navbar-height: 70px;
+
+  /* Typography */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+
+  font-family: var(--font-sans);
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--text-primary);
+  background-color: var(--bg-canvas);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+  overflow-x: hidden;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+a {
+  color: var(--teal-primary);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+a:hover {
+  color: var(--teal-primary-hover);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
