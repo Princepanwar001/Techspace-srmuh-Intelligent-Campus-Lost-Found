@@ -323,7 +323,7 @@ export async function awardVerifiedReturnXp({ item, claim }) {
     !item ||
     !item._id ||
     item.moderated === true ||
-    item.type !== "FOUND" ||
+    (item.type !== "FOUND" && item.type !== "LOST") ||
     !claim ||
     !claim._id ||
     claim.status !== "APPROVED"
@@ -332,12 +332,17 @@ export async function awardVerifiedReturnXp({ item, claim }) {
   }
 
   const itemIdStr = item._id.toString();
-  const finderIdStr = item.reportedBy
+  const reporterIdStr = item.reportedBy
     ? (item.reportedBy._id || item.reportedBy).toString()
     : "";
-  const claimantIdStr = claim.claimant
+  const rawClaimantIdStr = claim.claimant
     ? (claim.claimant._id || claim.claimant).toString()
     : "";
+
+  const finderIdStr =
+    item.type === "FOUND" ? reporterIdStr : rawClaimantIdStr;
+  const claimantIdStr =
+    item.type === "FOUND" ? rawClaimantIdStr : reporterIdStr;
 
   // Never reward self-claims
   if (finderIdStr && claimantIdStr && finderIdStr === claimantIdStr) {

@@ -11,6 +11,7 @@ import {
   notifyClaimReviewed,
   notifyReportModerated,
 } from "../utils/notificationService.js";
+import { deleteMultipleImagesFromCloud } from "../utils/imageStorageService.js";
 
 const router = express.Router();
 
@@ -557,13 +558,27 @@ router.delete("/items/:id", async (req, res) => {
 
     const reason = rawReason || "Removed by moderator";
 
+    const cloudPublicIdsToDelete = Array.isArray(item.images)
+      ? item.images.map((img) => img?.publicId).filter(Boolean)
+      : [];
+
     item.moderated = true;
     item.moderatedAt = new Date();
     item.moderatedBy = req.user._id;
     item.moderationReason = reason;
     item.status = "CLOSED";
+    if (
+      item.rewardStatus === "OFFERED" ||
+      item.rewardStatus === "SETTLEMENT_PENDING"
+    ) {
+      item.rewardStatus = "CANCELLED";
+    }
 
     await item.save();
+
+    if (cloudPublicIdsToDelete.length > 0) {
+      await deleteMultipleImagesFromCloud(cloudPublicIdsToDelete);
+    }
 
     try {
       await revokeModeratedReportXp(item);

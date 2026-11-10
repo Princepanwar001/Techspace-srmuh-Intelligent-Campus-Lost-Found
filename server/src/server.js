@@ -56,7 +56,29 @@ const apiRateLimiter = createRateLimiter({
   message: "Too many API requests, please slow down",
 });
 
-app.use(express.json({ limit: "100kb" }));
+const defaultJsonParser = express.json({ limit: "100kb" });
+const imageUploadJsonParser = express.json({ limit: "38mb" });
+const imageUploadMultipartParser = express.raw({
+  type: () => true,
+  limit: "38mb",
+});
+
+app.use((req, res, next) => {
+  const isItemImagesRoute = /^\/api\/items\/[^/]+\/images(?:\/|$)/.test(
+    req.path
+  );
+  const isItemCreateRoute =
+    req.method === "POST" && /^\/api\/items\/?$/.test(req.path);
+
+  if (isItemImagesRoute || isItemCreateRoute) {
+    const contentType = req.get("content-type") || "";
+    if (contentType.toLowerCase().startsWith("multipart/form-data")) {
+      return imageUploadMultipartParser(req, res, next);
+    }
+    return imageUploadJsonParser(req, res, next);
+  }
+  return defaultJsonParser(req, res, next);
+});
 app.use("/api", apiRateLimiter);
 app.use("/api/auth", authRateLimiter, authRoutes);
 app.use("/api/items", itemRoutes);

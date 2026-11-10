@@ -28,6 +28,10 @@ lerna-debug.log*
 coverage/
 .nyc_output/
 
+# Local Uploaded Media Assets
+uploads/
+server/uploads/
+
 # OS-Specific Metadata
 .DS_Store
 .DS_Store?

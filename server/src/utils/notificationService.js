@@ -163,3 +163,92 @@ export async function notifyReportModerated({ item }) {
     itemId: item._id,
   });
 }
+
+// Notify owner and finder when a voluntary reward enters SETTLEMENT_PENDING or is mutually SETTLED.
+export async function notifyRewardSettlementUpdate({
+  item,
+  claim = null,
+  stage = "SETTLEMENT_PENDING",
+}) {
+  if (!item || !item._id) {
+    return { ownerNotification: null, finderNotification: null };
+  }
+
+  const ownerIdStr = (
+    item.rewardSettlement?.ownerUserId ||
+    item.reportedBy?._id ||
+    item.reportedBy ||
+    ""
+  ).toString();
+  const finderIdStr = (
+    item.rewardSettlement?.finderUserId ||
+    claim?.claimant?._id ||
+    claim?.claimant ||
+    ""
+  ).toString();
+
+  const safeTitle =
+    typeof item.title === "string" ? item.title.trim().slice(0, 60) : "item";
+  const amountInr = Math.round((Number(item.rewardAmountPaise) || 0) / 100);
+
+  let ownerNotification = null;
+  let finderNotification = null;
+
+  if (stage === "SETTLEMENT_PENDING") {
+    if (ownerIdStr && mongoose.isValidObjectId(ownerIdStr)) {
+      ownerNotification = await createNotificationIfNotExists({
+        recipientId: ownerIdStr,
+        type: "REWARD_SETTLEMENT_PENDING",
+        title: "Reward settlement awaiting confirmation",
+        message: `Handover verified for "${safeTitle}". After settling the voluntary ₹${amountInr} reward externally, confirm settlement in LostLink.`,
+        idempotencyKey: `notif:reward_pending:${item._id.toString()}:${ownerIdStr}`,
+        itemId: item._id,
+        claimId: claim?._id || item.rewardSettlement?.linkedClaimId || null,
+      });
+    }
+    if (
+      finderIdStr &&
+      mongoose.isValidObjectId(finderIdStr) &&
+      finderIdStr !== ownerIdStr
+    ) {
+      finderNotification = await createNotificationIfNotExists({
+        recipientId: finderIdStr,
+        type: "REWARD_SETTLEMENT_PENDING",
+        title: "Voluntary reward awaiting mutual confirmation",
+        message: `Return verified for "${safeTitle}". Once the voluntary ₹${amountInr} reward is settled externally, confirm receipt in LostLink.`,
+        idempotencyKey: `notif:reward_pending:${item._id.toString()}:${finderIdStr}`,
+        itemId: item._id,
+        claimId: claim?._id || item.rewardSettlement?.linkedClaimId || null,
+      });
+    }
+  } else if (stage === "SETTLED") {
+    if (ownerIdStr && mongoose.isValidObjectId(ownerIdStr)) {
+      ownerNotification = await createNotificationIfNotExists({
+        recipientId: ownerIdStr,
+        type: "REWARD_SETTLED",
+        title: "Voluntary reward marked as settled",
+        message: `Both owner and finder confirmed the voluntary ₹${amountInr} reward settlement for "${safeTitle}".`,
+        idempotencyKey: `notif:reward_settled:${item._id.toString()}:${ownerIdStr}`,
+        itemId: item._id,
+        claimId: claim?._id || item.rewardSettlement?.linkedClaimId || null,
+      });
+    }
+    if (
+      finderIdStr &&
+      mongoose.isValidObjectId(finderIdStr) &&
+      finderIdStr !== ownerIdStr
+    ) {
+      finderNotification = await createNotificationIfNotExists({
+        recipientId: finderIdStr,
+        type: "REWARD_SETTLED",
+        title: "Voluntary reward settlement completed",
+        message: `Mutual confirmation recorded! The voluntary ₹${amountInr} reward for "${safeTitle}" is now marked SETTLED.`,
+        idempotencyKey: `notif:reward_settled:${item._id.toString()}:${finderIdStr}`,
+        itemId: item._id,
+        claimId: claim?._id || item.rewardSettlement?.linkedClaimId || null,
+      });
+    }
+  }
+
+  return { ownerNotification, finderNotification };
+}

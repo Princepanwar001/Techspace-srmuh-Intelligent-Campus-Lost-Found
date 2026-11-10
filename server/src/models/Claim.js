@@ -49,6 +49,14 @@ const claimSchema = new mongoose.Schema(
       maxlength: 500,
       default: "",
     },
+
+    // Optional reference to the claimant's LOST item report (e.g., when claiming a FOUND item
+    // that matches a LOST report carrying an optional monetary reward offer).
+    linkedLostItem: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Item",
+      default: null,
+    },
   },
   { timestamps: true }
 );

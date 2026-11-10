@@ -36,6 +36,11 @@ import {
   createRateLimiter,
   securityHeaders,
 } from "../middleware/securityMiddleware.js";
+import {
+  isCloudStorageConfigured,
+  setCloudStorageAdapterForTests,
+  stripImageMetadata,
+} from "../utils/imageStorageService.js";
 
 dotenv.config({ quiet: true });
 
@@ -43,7 +48,21 @@ function createTestApp() {
   const app = express();
   app.disable("x-powered-by");
   app.use(securityHeaders);
-  app.use(express.json({ limit: "100kb" }));
+  const standardJsonParser = express.json({ limit: "100kb" });
+  const imageUploadJsonParser = express.json({ limit: "38mb" });
+  app.use((req, res, next) => {
+    if (
+      req.method === "POST" &&
+      /^\/api\/items\/[^/]+\/images\/?$/.test(req.path)
+    ) {
+      const contentType = String(req.headers["content-type"] || "").toLowerCase();
+      if (contentType.startsWith("multipart/form-data")) {
+        return next();
+      }
+      return imageUploadJsonParser(req, res, next);
+    }
+    return standardJsonParser(req, res, next);
+  });
   app.use("/api/auth", authRoutes);
   app.use("/api/items", itemRoutes);
   app.use("/api/admin", adminRoutes);
@@ -3257,7 +3276,729 @@ async function runTests() {
         adminReauthAnalyticsRes.data?.success === true,
       `${adminGoogleLoginRes.status}/${adminReauthAnalyticsRes.status}`
     );
+
+    // =========================================================================
+    // PHASE 9: PHOTO UPLOADS + MONETARY REWARD SYSTEM SECURITY & WORKFLOW TESTS
+    // =========================================================================
+    {
+    // Build synthetic valid JPEG (with APP1 EXIF GPS segment) and PNG buffers
+    const exifPayload = Buffer.from("Exif\0\0GPS-SECRET-COORDS:28.9845,77.0151", "ascii");
+    const app1Length = exifPayload.length + 2;
+    const sampleJpegWithExif = Buffer.concat([
+      Buffer.from([0xff, 0xd8]), // SOI
+      Buffer.from([0xff, 0xe1, (app1Length >> 8) & 0xff, app1Length & 0xff]), // APP1 EXIF
+      exifPayload,
+      Buffer.from([0xff, 0xdb, 0x00, 0x04, 0x00, 0x01]), // DQT
+      Buffer.from([0xff, 0xda, 0x00, 0x02, 0x01, 0x02, 0x03, 0xff, 0xd9]), // SOS + scan + EOI
+    ]);
+    const sampleJpegDataUrl = `data:image/jpeg;base64,${sampleJpegWithExif.toString("base64")}`;
+
+    const samplePngBuffer = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
+      0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+      0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00,
+      0x90, 0x77, 0x53, 0xde,
+      0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82, // IEND chunk
+    ]);
+    const samplePngDataUrl = `data:image/png;base64,${samplePngBuffer.toString("base64")}`;
+
+    // Create a LOST item owned by Student A with an initial ₹500 (50000 paise) reward offer
+    const p9LostCreateRes = await apiRequest(baseUrl, "/api/items", {
+      method: "POST",
+      token: tokenA,
+      body: {
+        title: `P9 Lost Camera ${runTag}`,
+        description: "Mirrorless digital camera in black sleeve lost near auditorium",
+        category: "Electronics",
+        type: "LOST",
+        location: "Main Auditorium",
+        itemDate: new Date().toISOString().slice(0, 10),
+        rewardAmountPaise: 50000,
+        rewardCurrency: "INR",
+      },
+    });
+    const p9LostItemId = p9LostCreateRes.data?.item?._id;
+    if (p9LostItemId) createdItemIds.push(p9LostItemId);
+
+    // Case 87: Unauthenticated image upload, visibility patch, and delete are rejected with HTTP 401
+    const unauthImgPost = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images`,
+      {
+        method: "POST",
+        body: {
+          images: [{ dataUrl: sampleJpegDataUrl, visibility: "PUBLIC" }],
+        },
+      }
+    );
+    const unauthImgPatch = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images/507f1f77bcf86cd799439011`,
+      {
+        method: "PATCH",
+        body: { visibility: "PRIVATE" },
+      }
+    );
+    const unauthImgDel = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images/507f1f77bcf86cd799439011`,
+      {
+        method: "DELETE",
+      }
+    );
+    record(
+      87,
+      "Phase 9 Image Auth: Unauthenticated image upload, visibility update, and deletion return 401",
+      unauthImgPost.status === 401 &&
+        unauthImgPatch.status === 401 &&
+        unauthImgDel.status === 401,
+      `${unauthImgPost.status}/${unauthImgPatch.status}/${unauthImgDel.status}`
+    );
+
+    // Case 88: Unauthorized user (Student B) cannot upload, modify, or delete Student A's item images (403)
+    const unauthUserImgPost = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images`,
+      {
+        method: "POST",
+        token: tokenB,
+        body: {
+          images: [{ dataUrl: sampleJpegDataUrl, visibility: "PUBLIC" }],
+        },
+      }
+    );
+    const unauthUserImgPatch = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images/507f1f77bcf86cd799439011`,
+      {
+        method: "PATCH",
+        token: tokenB,
+        body: { visibility: "PRIVATE" },
+      }
+    );
+    const unauthUserImgDel = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images/507f1f77bcf86cd799439011`,
+      {
+        method: "DELETE",
+        token: tokenB,
+      }
+    );
+    record(
+      88,
+      "Phase 9 Image RBAC: Non-owner student cannot upload, modify, or delete another user's item images (403)",
+      unauthUserImgPost.status === 403 &&
+        unauthUserImgPatch.status === 403 &&
+        unauthUserImgDel.status === 403,
+      `${unauthUserImgPost.status}/${unauthUserImgPatch.status}/${unauthUserImgDel.status}`
+    );
+
+    // Case 89: Invalid MIME type (SVG/PDF) and magic-byte mismatch (text disguised as JPEG) are rejected (400)
+    const svgFakeDataUrl = `data:image/svg+xml;base64,${Buffer.from("<svg><script>alert(1)</script></svg>").toString("base64")}`;
+    const disguisedJpegDataUrl = `data:image/jpeg;base64,${Buffer.from("NOT_A_REAL_JPEG_BINARY_HEADER").toString("base64")}`;
+    const badMimeRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: { images: [{ dataUrl: svgFakeDataUrl, visibility: "PUBLIC" }] },
+      }
+    );
+    const badMagicRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: {
+          images: [{ dataUrl: disguisedJpegDataUrl, visibility: "PUBLIC" }],
+        },
+      }
+    );
+    record(
+      89,
+      "Phase 9 Image Validation: Unsupported MIME type (SVG) and magic-byte mismatch return 400",
+      badMimeRes.status === 400 && badMagicRes.status === 400,
+      `${badMimeRes.status}/${badMagicRes.status}`
+    );
+
+    // Case 90: Oversized image (> 5 MB) and image count limit (> 5 images) are rejected with HTTP 400
+    const oversizedBuf = Buffer.alloc(5 * 1024 * 1024 + 64, 0x41);
+    oversizedBuf[0] = 0xff;
+    oversizedBuf[1] = 0xd8;
+    oversizedBuf[2] = 0xff;
+    const oversizedDataUrl = `data:image/jpeg;base64,${oversizedBuf.toString("base64")}`;
+    const oversizedRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: { images: [{ dataUrl: oversizedDataUrl, visibility: "PUBLIC" }] },
+      }
+    );
+    const sixImagesRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: {
+          images: Array.from({ length: 6 }, () => ({
+            dataUrl: samplePngDataUrl,
+            visibility: "PUBLIC",
+          })),
+        },
+      }
+    );
+    record(
+      90,
+      "Phase 9 Image Limits: Oversized image (>5 MB) and >5 images per report return 400",
+      oversizedRes.status === 400 && sixImagesRes.status === 400,
+      `${oversizedRes.status}/${sixImagesRes.status}`
+    );
+
+    // Case 91: Storage service failure handling & atomic batch rollback (503 when unconfigured, 502 on provider failure)
+    setCloudStorageAdapterForTests({ simulateUnconfigured: true });
+    const unconfiguredStatusExpected = isCloudStorageConfigured() ? 201 : 503;
+    let unconfiguredResStatus = 503;
+    if (!isCloudStorageConfigured()) {
+      const unconfRes = await apiRequest(
+        baseUrl,
+        `/api/items/${p9LostItemId}/images`,
+        {
+          method: "POST",
+          token: tokenA,
+          body: {
+            images: [{ dataUrl: sampleJpegDataUrl, visibility: "PUBLIC" }],
+          },
+        }
+      );
+      unconfiguredResStatus = unconfRes.status;
+    }
+
+    const rolledBackPublicIds = [];
+    let failAttemptCount = 0;
+    setCloudStorageAdapterForTests({
+      async uploadImage() {
+        failAttemptCount += 1;
+        if (failAttemptCount === 1) {
+          return {
+            url: "https://res.cloudinary.com/demo/image/upload/v1/lostlink/temp-1.jpg",
+            publicId: "lostlink/temp-rollback-1",
+          };
+        }
+        const err = new Error("Simulated cloud storage outage on 2nd photo");
+        err.code = "STORAGE_UPLOAD_FAILED";
+        throw err;
+      },
+      async deleteImage(publicId) {
+        rolledBackPublicIds.push(publicId);
+        return { deleted: true };
+      },
+    });
+    const partialBatchFailRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: {
+          images: [
+            { dataUrl: sampleJpegDataUrl, visibility: "PUBLIC" },
+            { dataUrl: samplePngDataUrl, visibility: "PRIVATE" },
+          ],
+        },
+      }
+    );
+    const itemAfterRollback = await Item.findById(p9LostItemId).lean();
+    record(
+      91,
+      "Phase 9 Storage Resilience: Unconfigured storage (503) and mid-batch upload error (502) roll back cleanly without partial DB state",
+      (isCloudStorageConfigured() || unconfiguredResStatus === unconfiguredStatusExpected) &&
+        partialBatchFailRes.status === 502 &&
+        rolledBackPublicIds.includes("lostlink/temp-rollback-1") &&
+        (itemAfterRollback?.images?.length || 0) === 0,
+      `${unconfiguredResStatus}/${partialBatchFailRes.status}/ROLLBACK:${rolledBackPublicIds.length}`
+    );
+
+    // Case 92: Image visibility authorization (PUBLIC vs PRIVATE), EXIF stripping, and cloud asset deletion
+    const uploadedBuffers = [];
+    const deletedPublicIds = [];
+    let uploadSeq = 0;
+    setCloudStorageAdapterForTests({
+      async uploadImage({ buffer }) {
+        uploadSeq += 1;
+        uploadedBuffers.push(buffer);
+        return {
+          url: `https://res.cloudinary.com/demo/image/upload/v1/lostlink/test-img-${uploadSeq}.jpg`,
+          publicId: `lostlink/test-public-id-${uploadSeq}`,
+        };
+      },
+      async deleteImage(publicId) {
+        deletedPublicIds.push(publicId);
+        return { deleted: true };
+      },
+    });
+
+    const uploadTwoRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: {
+          images: [
+            { dataUrl: sampleJpegDataUrl, visibility: "PUBLIC" },
+            { dataUrl: samplePngDataUrl, visibility: "PRIVATE" },
+          ],
+        },
+      }
+    );
+    const exifStripped =
+      uploadedBuffers.length >= 1 &&
+      !uploadedBuffers[0].includes(Buffer.from("GPS-SECRET-COORDS", "ascii")) &&
+      !stripImageMetadata(sampleJpegWithExif, "image/jpeg").includes(
+        Buffer.from("GPS-SECRET-COORDS", "ascii")
+      );
+
+    // Verify public listing & non-owner detail only return the 1 PUBLIC photo and never expose publicId
+    const publicDetailForB = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}`,
+      { token: tokenB }
+    );
+    const ownerDetailForA = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}`,
+      { token: tokenA }
+    );
+    const adminDetailRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}`,
+      { token: adminGoogleLoginRes.data?.token }
+    );
+
+    const bImages = publicDetailForB.data?.item?.images || [];
+    const aImages = ownerDetailForA.data?.item?.images || [];
+    const adminImages = adminDetailRes.data?.item?.images || [];
+    const privateImgId = aImages.find((img) => img.visibility === "PRIVATE")?._id;
+
+    // Toggle PRIVATE -> PUBLIC and then delete the second image
+    const toggleVisRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images/${privateImgId}`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { visibility: "PUBLIC" },
+      }
+    );
+    const delSingleImgRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/images/${privateImgId}`,
+      {
+        method: "DELETE",
+        token: tokenA,
+      }
+    );
+    record(
+      92,
+      "Phase 9 Image Privacy & EXIF Strip: Strips EXIF GPS bytes, hides PRIVATE photos from non-owners, allows owner/admin view, and deletes cloud asset",
+      uploadTwoRes.status === 201 &&
+        exifStripped === true &&
+        bImages.length === 1 &&
+        bImages[0].visibility === "PUBLIC" &&
+        bImages[0].publicId === undefined &&
+        aImages.length === 2 &&
+        adminImages.length === 2 &&
+        toggleVisRes.status === 200 &&
+        delSingleImgRes.status === 200 &&
+        deletedPublicIds.includes("lostlink/test-public-id-2"),
+      `UP:${uploadTwoRes.status}/B_IMGS:${bImages.length}/A_IMGS:${aImages.length}/EXIF_STRIPPED:${exifStripped}`
+    );
+
+    // Case 93: Unauthorized reward modification/cancellation rejection (401/403)
+    const unauthRewardPatch = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        body: { rewardAmountPaise: 75000 },
+      }
+    );
+    const studentBRewardPatch = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenB,
+        body: { rewardAmountPaise: 75000 },
+      }
+    );
+    const studentBRewardCancel = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenB,
+        body: { rewardStatus: "CANCELLED" },
+      }
+    );
+    record(
+      93,
+      "Phase 9 Reward Auth: Unauthenticated (401) and non-owner student (403) cannot modify or cancel reward offers",
+      unauthRewardPatch.status === 401 &&
+        studentBRewardPatch.status === 403 &&
+        studentBRewardCancel.status === 403,
+      `${unauthRewardPatch.status}/${studentBRewardPatch.status}/${studentBRewardCancel.status}`
+    );
+
+    // Case 94: Negative, zero, fractional, non-INR, and oversized (> MAX_REWARD_PAISE) reward amounts rejected (400)
+    const negRewardRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { rewardAmountPaise: -5000 },
+      }
+    );
+    const fracRewardRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { rewardAmountPaise: 250.75 },
+      }
+    );
+    const subMinRewardRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { rewardAmountPaise: 50 },
+      }
+    );
+    const hugeRewardRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { rewardAmountPaise: 999999900 },
+      }
+    );
+    const badCurrencyRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { rewardAmountPaise: 50000, rewardCurrency: "USD" },
+      }
+    );
+    record(
+      94,
+      "Phase 9 Reward Validation: Negative, fractional, <100 paise, >MAX_REWARD_PAISE, and non-INR currency return 400",
+      negRewardRes.status === 400 &&
+        fracRewardRes.status === 400 &&
+        subMinRewardRes.status === 400 &&
+        hugeRewardRes.status === 400 &&
+        badCurrencyRes.status === 400,
+      `${negRewardRes.status}/${fracRewardRes.status}/${subMinRewardRes.status}/${hugeRewardRes.status}/${badCurrencyRes.status}`
+    );
+
+    // Case 95: Invalid reward status transitions (direct SETTLED, or settling before item is RETURNED) are rejected (400/409)
+    const directSettlePatchRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { rewardStatus: "SETTLED" },
+      }
+    );
+    const prematureConfirmRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward/confirm-settlement`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: {},
+      }
+    );
+    // Owner can legitimately update OPEN LOST item reward from ₹500 to ₹600 (60000 paise)
+    const validUpdateRewardRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { rewardAmountPaise: 60000, rewardCurrency: "INR" },
+      }
+    );
+    record(
+      95,
+      "Phase 9 Reward Transitions: Direct SETTLED patch (409) and pre-return settlement confirmation (409) blocked; valid OPEN reward update (200) succeeds",
+      (directSettlePatchRes.status === 409 || directSettlePatchRes.status === 400) &&
+        prematureConfirmRes.status === 409 &&
+        validUpdateRewardRes.status === 200 &&
+        validUpdateRewardRes.data?.item?.rewardAmountPaise === 60000,
+      `${directSettlePatchRes.status}/${prematureConfirmRes.status}/${validUpdateRewardRes.status}`
+    );
+
+    // Case 96: Mutual settlement confirmation workflow & double-settlement idempotency
+    // Step 1: Student C submits an unverified claim that gets REJECTED -> rewardStatus must remain OFFERED
+    const p9RejectedClaimSub = await apiRequest(baseUrl, "/api/claims", {
+      method: "POST",
+      token: tokenC,
+      body: {
+        itemId: p9LostItemId,
+        proofDescription: "Unverified claim with wrong serial number details",
+      },
+    });
+    if (p9RejectedClaimSub.data?.claim?._id) {
+      createdClaimIds.push(p9RejectedClaimSub.data.claim._id);
+    }
+    const rejectReviewRes = await apiRequest(
+      baseUrl,
+      `/api/claims/${p9RejectedClaimSub.data?.claim?._id}/review`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { status: "REJECTED", reviewNote: "Serial number did not match" },
+      }
+    );
+    const afterRejectItem = await Item.findById(p9LostItemId).lean();
+
+    // Step 2: Finder (Student B) submits a valid claim on the LOST item with active reward offer
+    const finderClaimSub = await apiRequest(baseUrl, "/api/claims", {
+      method: "POST",
+      token: tokenB,
+      body: {
+        itemId: p9LostItemId,
+        proofDescription: "Found the black sleeve mirrorless camera behind row G in Main Auditorium",
+      },
+    });
+    if (finderClaimSub.data?.claim?._id) {
+      createdClaimIds.push(finderClaimSub.data.claim._id);
+    }
+
+    // Step 3: Owner (Student A) approves the claim -> item becomes RETURNED & rewardStatus becomes SETTLEMENT_PENDING
+    const approveFinderClaimRes = await apiRequest(
+      baseUrl,
+      `/api/claims/${finderClaimSub.data?.claim?._id}/review`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { status: "APPROVED", reviewNote: "Camera verified and returned in person" },
+      }
+    );
+    const afterApproveItem = await Item.findById(p9LostItemId).lean();
+
+    // Verify reward cannot be cancelled once in SETTLEMENT_PENDING (409)
+    const cancelDuringPendingRes = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { rewardStatus: "CANCELLED" },
+      }
+    );
+
+    // Step 4: Owner confirms settlement -> rewardStatus stays SETTLEMENT_PENDING until finder also confirms
+    const ownerConfirmRes1 = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward/confirm-settlement`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: {},
+      }
+    );
+    // Duplicate owner confirmation is idempotent and still does NOT settle unilaterally
+    const ownerConfirmRes2 = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward/confirm-settlement`,
+      {
+        method: "POST",
+        token: tokenA,
+        body: {},
+      }
+    );
+
+    // Step 5: Finder (Student B) confirms settlement -> rewardStatus transitions to SETTLED
+    const finderConfirmRes1 = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward/confirm-settlement`,
+      {
+        method: "POST",
+        token: tokenB,
+        body: {},
+      }
+    );
+    // Step 6: Duplicate confirmation after SETTLED is idempotent (200, idempotent: true)
+    const finderConfirmRes2 = await apiRequest(
+      baseUrl,
+      `/api/items/${p9LostItemId}/reward/confirm-settlement`,
+      {
+        method: "POST",
+        token: tokenB,
+        body: {},
+      }
+    );
+    record(
+      96,
+      "Phase 9 Mutual Settlement & Idempotency: Rejected claim stays OFFERED; approved return sets SETTLEMENT_PENDING; settles ONLY after both owner & finder confirm; duplicate calls are idempotent",
+      rejectReviewRes.status === 200 &&
+        afterRejectItem?.rewardStatus === "OFFERED" &&
+        approveFinderClaimRes.status === 200 &&
+        afterApproveItem?.status === "RETURNED" &&
+        afterApproveItem?.rewardStatus === "SETTLEMENT_PENDING" &&
+        cancelDuringPendingRes.status === 409 &&
+        ownerConfirmRes1.status === 200 &&
+        ownerConfirmRes1.data?.item?.rewardStatus === "SETTLEMENT_PENDING" &&
+        ownerConfirmRes2.status === 200 &&
+        ownerConfirmRes2.data?.item?.rewardStatus === "SETTLEMENT_PENDING" &&
+        finderConfirmRes1.status === 200 &&
+        finderConfirmRes1.data?.item?.rewardStatus === "SETTLED" &&
+        Boolean(finderConfirmRes1.data?.item?.rewardSettledAt) &&
+        finderConfirmRes2.status === 200 &&
+        finderConfirmRes2.data?.idempotent === true,
+      `PENDING:${ownerConfirmRes1.data?.item?.rewardStatus}->SETTLED:${finderConfirmRes1.data?.item?.rewardStatus}`
+    );
+
+    // Case 97: Reward ownership validation (FOUND item cannot offer reward; third party cannot confirm settlement)
+    const foundWithRewardAttempt = await apiRequest(baseUrl, "/api/items", {
+      method: "POST",
+      token: tokenB,
+      body: {
+        title: `P9 Found Watch ${runTag}`,
+        description: "Silver watch found near cafeteria",
+        category: "Accessories",
+        type: "FOUND",
+        location: "Cafeteria",
+        itemDate: new Date().toISOString().slice(0, 10),
+        rewardAmountPaise: 20000,
+      },
+    });
+    const validFoundRes = await apiRequest(baseUrl, "/api/items", {
+      method: "POST",
+      token: tokenB,
+      body: {
+        title: `P9 Found Watch Valid ${runTag}`,
+        description: "Silver watch found near cafeteria counter",
+        category: "Accessories",
+        type: "FOUND",
+        location: "Cafeteria",
+        itemDate: new Date().toISOString().slice(0, 10),
+      },
+    });
+    const p9FoundItemId = validFoundRes.data?.item?._id;
+    if (p9FoundItemId) createdItemIds.push(p9FoundItemId);
+
+    const patchFoundRewardAttempt = await apiRequest(
+      baseUrl,
+      `/api/items/${p9FoundItemId}/reward`,
+      {
+        method: "PATCH",
+        token: tokenB,
+        body: { rewardAmountPaise: 20000 },
+      }
+    );
+
+    // Create a second LOST item with reward to test third-party confirmation rejection (403)
+    const lostForThirdPartyRes = await apiRequest(baseUrl, "/api/items", {
+      method: "POST",
+      token: tokenA,
+      body: {
+        title: `P9 Lost Headphones ${runTag}`,
+        description: "Noise cancelling headphones in hard case",
+        category: "Electronics",
+        type: "LOST",
+        location: "Library",
+        itemDate: new Date().toISOString().slice(0, 10),
+        rewardAmountPaise: 30000,
+      },
+    });
+    const lostThirdId = lostForThirdPartyRes.data?.item?._id;
+    if (lostThirdId) createdItemIds.push(lostThirdId);
+    const claimThirdSub = await apiRequest(baseUrl, "/api/claims", {
+      method: "POST",
+      token: tokenB,
+      body: {
+        itemId: lostThirdId,
+        proofDescription: "Found the headphones in library reading hall table 4",
+      },
+    });
+    if (claimThirdSub.data?.claim?._id) {
+      createdClaimIds.push(claimThirdSub.data.claim._id);
+    }
+    await apiRequest(
+      baseUrl,
+      `/api/claims/${claimThirdSub.data?.claim?._id}/review`,
+      {
+        method: "PATCH",
+        token: tokenA,
+        body: { status: "APPROVED", reviewNote: "Verified" },
+      }
+    );
+    const thirdPartyConfirmAttempt = await apiRequest(
+      baseUrl,
+      `/api/items/${lostThirdId}/reward/confirm-settlement`,
+      {
+        method: "POST",
+        token: tokenC,
+        body: {},
+      }
+    );
+    record(
+      97,
+      "Phase 9 Reward Ownership Guard: FOUND items cannot offer rewards (400) and uninvolved third party cannot confirm settlement (403)",
+      foundWithRewardAttempt.status === 400 &&
+        patchFoundRewardAttempt.status === 400 &&
+        thirdPartyConfirmAttempt.status === 403,
+      `${foundWithRewardAttempt.status}/${patchFoundRewardAttempt.status}/${thirdPartyConfirmAttempt.status}`
+    );
+
+    // Case 98: Backward compatibility for standard reports without images or rewards
+    const plainReportRes = await apiRequest(baseUrl, "/api/items", {
+      method: "POST",
+      token: tokenA,
+      body: {
+        title: `P9 Plain Notebook ${runTag}`,
+        description: "Spiral notebook with physics notes",
+        category: "Books",
+        type: "LOST",
+        location: "Physics Lab",
+        itemDate: new Date().toISOString().slice(0, 10),
+      },
+    });
+    const plainItem = plainReportRes.data?.item;
+    if (plainItem?._id) createdItemIds.push(plainItem._id);
+    const plainGetRes = await apiRequest(
+      baseUrl,
+      `/api/items/${plainItem?._id}`
+    );
+    record(
+      98,
+      "Phase 9 Backward Compatibility: Reports without photos or rewards default to images=[], rewardAmountPaise=0, rewardStatus='NONE'",
+      plainReportRes.status === 201 &&
+        Array.isArray(plainGetRes.data?.item?.images) &&
+        plainGetRes.data.item.images.length === 0 &&
+        plainGetRes.data?.item?.rewardAmountPaise === 0 &&
+        plainGetRes.data?.item?.rewardCurrency === "INR" &&
+        plainGetRes.data?.item?.rewardStatus === "NONE",
+      `${plainReportRes.status}/${plainGetRes.status}`
+    );
+    }
   } finally {
+    setCloudStorageAdapterForTests(null);
     // Clean up ONLY test records created by this run
     if (
       createdUserIds.length > 0 ||

@@ -30,6 +30,119 @@ const ITEM_STATUSES = [
   "CLOSED",
 ];
 
+const MAX_IMAGES_PER_ITEM = 5;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const MAX_REWARD_INR = 50000;
+
+function formatInrFromPaise(paise) {
+  const num = Number(paise);
+  if (!Number.isFinite(num) || num <= 0) return "";
+  const inr = num / 100;
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: Number.isInteger(inr) ? 0 : 2,
+  }).format(inr);
+}
+
+function getRewardBadgeMeta(item) {
+  if (
+    !item ||
+    typeof item.rewardAmountPaise !== "number" ||
+    item.rewardAmountPaise <= 0 ||
+    !item.rewardStatus ||
+    item.rewardStatus === "NONE"
+  ) {
+    return null;
+  }
+
+  const formatted = formatInrFromPaise(item.rewardAmountPaise);
+  const statusMap = {
+    OFFERED: {
+      statusText: "OFFERED",
+      statusClass: "reward-offered",
+    },
+    SETTLEMENT_PENDING: {
+      statusText: "SETTLEMENT PENDING",
+      statusClass: "reward-pending",
+    },
+    SETTLED: {
+      statusText: "SETTLED",
+      statusClass: "reward-settled",
+    },
+    CANCELLED: {
+      statusText: "CANCELLED",
+      statusClass: "reward-cancelled",
+    },
+  };
+
+  const mapped = statusMap[item.rewardStatus] || {
+    statusText: item.rewardStatus,
+    statusClass: "reward-offered",
+  };
+
+  return {
+    formatted,
+    statusText: mapped.statusText,
+    statusClass: mapped.statusClass,
+    label: `Reward: ${formatted} · ${mapped.statusText}`,
+  };
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Could not read image file."));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function prepareImageFileForUpload(file, defaultVisibility = "PUBLIC") {
+  if (!file || typeof file !== "object") {
+    throw new Error("Invalid image file selected.");
+  }
+  let mimeType = String(file.type || "").trim().toLowerCase();
+  if (mimeType === "image/jpg" || mimeType === "image/pjpeg") {
+    mimeType = "image/jpeg";
+  }
+  if (!mimeType) {
+    const lowerName = String(file.name || "").toLowerCase();
+    if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) {
+      mimeType = "image/jpeg";
+    } else if (lowerName.endsWith(".png")) {
+      mimeType = "image/png";
+    } else if (lowerName.endsWith(".webp")) {
+      mimeType = "image/webp";
+    }
+  }
+  if (!ALLOWED_IMAGE_TYPES.includes(mimeType)) {
+    throw new Error(
+      `Unsupported format "${file.name}". Only JPEG, PNG, and WebP images are allowed.`
+    );
+  }
+  if (file.size <= 0) {
+    throw new Error(`Image "${file.name}" is empty.`);
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    throw new Error(
+      `Image "${file.name}" exceeds the 5 MB per-photo limit.`
+    );
+  }
+
+  const rawDataUrl = await readFileAsDataUrl(file);
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    file,
+    name: file.name || "photo.jpg",
+    mimeType,
+    sizeBytes: file.size,
+    visibility: defaultVisibility === "PRIVATE" ? "PRIVATE" : "PUBLIC",
+    dataUrl: rawDataUrl,
+  };
+}
+
 function getToday() {
   const date = new Date();
   const year = date.getFullYear();
@@ -47,6 +160,7 @@ function createEmptyForm() {
     type: "LOST",
     location: "",
     itemDate: getToday(),
+    rewardInr: "",
   };
 }
 
@@ -116,6 +230,7 @@ function App() {
   // UI Navigation, Inline Edit & Detail Expansion state
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [expandedItemIds, setExpandedItemIds] = useState({});
+  const [itemDetailById, setItemDetailById] = useState({});
   const [editingItemId, setEditingItemId] = useState("");
   const [editForm, setEditForm] = useState({
     title: "",
@@ -124,8 +239,18 @@ function App() {
     type: "LOST",
     location: "",
     itemDate: getToday(),
+    rewardInr: "",
   });
   const [editSubmitting, setEditSubmitting] = useState(false);
+
+  // Photo Upload & Monetary Reward state
+  const [pendingImages, setPendingImages] = useState([]);
+  const [imageUploadError, setImageUploadError] = useState("");
+  const [uploadingImagesForId, setUploadingImagesForId] = useState("");
+  const [activeLightboxImage, setActiveLightboxImage] = useState(null);
+  const [claimLinkedLostItemId, setClaimLinkedLostItemId] = useState("");
+  const [rewardActionItemId, setRewardActionItemId] = useState("");
+  const [rewardEditInputs, setRewardEditInputs] = useState({});
 
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -189,8 +314,16 @@ function App() {
       params.set("page", String(page));
       params.set("limit", "10");
 
+      const requestHeaders = {};
+      if (auth?.token) {
+        requestHeaders.Authorization = `Bearer ${auth.token}`;
+      }
+
       const response = await fetch(
-        `${API_URL}/api/items?${params.toString()}`
+        `${API_URL}/api/items?${params.toString()}`,
+        {
+          headers: requestHeaders,
+        }
       );
       const data = await response.json().catch(() => null);
 
@@ -242,6 +375,7 @@ function App() {
     dateTo,
     sortBy,
     page,
+    auth?.token,
   ]);
 
   function handleClearFilters() {
@@ -399,16 +533,21 @@ async function loadMyReports() {
     setNotice("");
 
     try {
+      const payload = {
+        itemId,
+        proofDescription: trimmedProof,
+      };
+      if (claimLinkedLostItemId) {
+        payload.linkedLostItemId = claimLinkedLostItemId;
+      }
+
       const response = await fetch(`${API_URL}/api/claims`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${auth.token}`,
         },
-        body: JSON.stringify({
-          itemId,
-          proofDescription: trimmedProof,
-        }),
+        body: JSON.stringify(payload),
       });
 
       const data = await response.json().catch(() => null);
@@ -419,6 +558,7 @@ async function loadMyReports() {
 
       setClaimingItemId("");
       setClaimProofText("");
+      setClaimLinkedLostItemId("");
       setMatchesByItem({});
       setNotice("Claim submitted! You can track its status in Claims.");
       await loadItems();
@@ -1246,9 +1386,17 @@ async function loadMyReports() {
     setShowNotificationsPanel(false);
     setMobileNavOpen(false);
     setExpandedItemIds({});
+    setItemDetailById({});
     setEditingItemId("");
     setClaimingItemId("");
     setClaimProofText("");
+    setClaimLinkedLostItemId("");
+    setPendingImages([]);
+    setImageUploadError("");
+    setUploadingImagesForId("");
+    setActiveLightboxImage(null);
+    setRewardActionItemId("");
+    setRewardEditInputs({});
     setClaimsError("");
     setAdminError("");
     setAdminUnauthorized(false);
@@ -1266,14 +1414,349 @@ async function loadMyReports() {
     }));
   }
 
+  async function handleSelectPendingImages(event) {
+    const fileList = Array.from(event.target.files || []);
+    event.target.value = "";
+    if (fileList.length === 0) return;
+
+    setImageUploadError("");
+    if (pendingImages.length + fileList.length > MAX_IMAGES_PER_ITEM) {
+      setImageUploadError(
+        `You can attach at most ${MAX_IMAGES_PER_ITEM} photos per report (${pendingImages.length} already selected).`
+      );
+      return;
+    }
+
+    try {
+      const prepared = [];
+      for (const file of fileList) {
+        const entry = await prepareImageFileForUpload(file, "PUBLIC");
+        prepared.push(entry);
+      }
+      setPendingImages((prev) =>
+        [...prev, ...prepared].slice(0, MAX_IMAGES_PER_ITEM)
+      );
+    } catch (err) {
+      setImageUploadError(err.message || "Could not prepare selected photo.");
+    }
+  }
+
+  function handlePendingImageVisibilityChange(tempId, nextVisibility) {
+    setPendingImages((prev) =>
+      prev.map((img) =>
+        img.id === tempId
+          ? {
+              ...img,
+              visibility: nextVisibility === "PRIVATE" ? "PRIVATE" : "PUBLIC",
+            }
+          : img
+      )
+    );
+  }
+
+  function handleRemovePendingImage(tempId) {
+    setPendingImages((prev) => prev.filter((img) => img.id !== tempId));
+    setImageUploadError("");
+  }
+
+  async function fetchItemDetail(itemId, tokenOverride = auth?.token) {
+    if (!itemId) return null;
+    try {
+      const headers = {};
+      if (tokenOverride) {
+        headers.Authorization = `Bearer ${tokenOverride}`;
+      }
+      const response = await fetch(`${API_URL}/api/items/${itemId}`, {
+        headers,
+      });
+      const data = await response.json().catch(() => null);
+      if (response.ok && data?.success && data.item) {
+        setItemDetailById((prev) => ({
+          ...prev,
+          [itemId]: data.item,
+        }));
+        return data.item;
+      }
+    } catch {
+      // Non-fatal detail enrichment
+    }
+    return null;
+  }
+
+  async function handleUploadImagesToExistingItem(itemId, fileList, visibility = "PUBLIC") {
+    if (!auth?.token || !itemId) return;
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+
+    setUploadingImagesForId(itemId);
+    setError("");
+    setNotice("");
+
+    try {
+      const formData = new FormData();
+      for (const file of files) {
+        const entry = await prepareImageFileForUpload(file, visibility);
+        formData.append("images", entry.file, entry.name);
+        formData.append("visibilities", entry.visibility);
+      }
+
+      const response = await fetch(`${API_URL}/api/items/${itemId}/images`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${auth.token}`,
+        },
+        body: formData,
+      });
+
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.message || "Could not upload photos.");
+      }
+
+      if (data.item) {
+        setItemDetailById((prev) => ({ ...prev, [itemId]: data.item }));
+        setItems((prev) =>
+          prev.map((it) => (it._id === itemId ? { ...it, ...data.item } : it))
+        );
+        setMyItems((prev) =>
+          prev.map((it) => (it._id === itemId ? { ...it, ...data.item } : it))
+        );
+      }
+      await loadItems();
+      if (showMyReports) {
+        await fetchMyItems();
+      }
+      setNotice(data.message || "Photos uploaded successfully.");
+    } catch (err) {
+      setError(err.message || "Could not upload photos.");
+    } finally {
+      setUploadingImagesForId("");
+    }
+  }
+
+  async function handleToggleExistingImageVisibility(itemId, imageId, currentVisibility) {
+    if (!auth?.token || !itemId || !imageId) return;
+    const nextVisibility = currentVisibility === "PRIVATE" ? "PUBLIC" : "PRIVATE";
+
+    setUploadingImagesForId(itemId);
+    setError("");
+    setNotice("");
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/items/${itemId}/images/${imageId}`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${auth.token}`,
+          },
+          body: JSON.stringify({ visibility: nextVisibility }),
+        }
+      );
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.message || "Could not update photo visibility.");
+      }
+
+      if (data.item) {
+        setItemDetailById((prev) => ({ ...prev, [itemId]: data.item }));
+      }
+      await loadItems();
+      if (showMyReports) {
+        await fetchMyItems();
+      }
+      setNotice(
+        `Photo visibility updated to ${
+          nextVisibility === "PRIVATE" ? "PRIVATE (Ownership Evidence)" : "PUBLIC"
+        }.`
+      );
+    } catch (err) {
+      setError(err.message || "Could not update photo visibility.");
+    } finally {
+      setUploadingImagesForId("");
+    }
+  }
+
+  async function handleDeleteExistingImage(itemId, imageId) {
+    if (!auth?.token || !itemId || !imageId) return;
+
+    setUploadingImagesForId(itemId);
+    setError("");
+    setNotice("");
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/items/${itemId}/images/${imageId}`,
+        {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${auth.token}`,
+          },
+        }
+      );
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.message || "Could not remove photo.");
+      }
+
+      if (data.item) {
+        setItemDetailById((prev) => ({ ...prev, [itemId]: data.item }));
+      }
+      await loadItems();
+      if (showMyReports) {
+        await fetchMyItems();
+      }
+      setNotice("Photo removed from report.");
+    } catch (err) {
+      setError(err.message || "Could not remove photo.");
+    } finally {
+      setUploadingImagesForId("");
+    }
+  }
+
+  async function handleUpdateItemReward(itemId, { amountInr, cancel = false }) {
+    if (!auth?.token || !itemId) return;
+
+    setRewardActionItemId(itemId);
+    setError("");
+    setNotice("");
+
+    try {
+      let bodyPayload = {};
+      if (cancel) {
+        bodyPayload = { rewardStatus: "CANCELLED" };
+      } else {
+        const parsedInr = Number(amountInr);
+        if (!Number.isFinite(parsedInr) || parsedInr < 1 || parsedInr > MAX_REWARD_INR) {
+          throw new Error(
+            `Reward amount must be between ₹1 and ₹${MAX_REWARD_INR.toLocaleString("en-IN")}.`
+          );
+        }
+        bodyPayload = {
+          rewardAmountPaise: Math.round(parsedInr * 100),
+          rewardCurrency: "INR",
+        };
+      }
+
+      const response = await fetch(`${API_URL}/api/items/${itemId}/reward`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${auth.token}`,
+        },
+        body: JSON.stringify(bodyPayload),
+      });
+
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.message || "Could not update reward offer.");
+      }
+
+      if (data.item) {
+        setItemDetailById((prev) => ({ ...prev, [itemId]: data.item }));
+      }
+      setMatchesByItem({});
+      await loadItems();
+      if (showMyReports) {
+        await fetchMyItems();
+      }
+      setNotice(data.message || "Reward offer updated.");
+    } catch (err) {
+      setError(err.message || "Could not update reward offer.");
+    } finally {
+      setRewardActionItemId("");
+    }
+  }
+
+  async function handleConfirmRewardSettlement(itemId) {
+    if (!auth?.token || !itemId) return;
+
+    setRewardActionItemId(itemId);
+    setError("");
+    setClaimsError("");
+    setNotice("");
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/items/${itemId}/reward/confirm-settlement`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${auth.token}`,
+          },
+          body: JSON.stringify({}),
+        }
+      );
+
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success) {
+        throw new Error(
+          data?.message || "Could not record reward settlement confirmation."
+        );
+      }
+
+      if (data.item) {
+        setItemDetailById((prev) => ({ ...prev, [itemId]: data.item }));
+      }
+      await loadItems();
+      if (showMyReports) {
+        await fetchMyItems();
+      }
+      if (showClaimsPanel) {
+        await fetchClaimsData(adminClaimsScope);
+      }
+      if (auth?.token) {
+        await fetchNotifications(auth.token);
+      }
+      setNotice(
+        data.message || "Reward settlement confirmation recorded."
+      );
+    } catch (err) {
+      setError(err.message || "Could not confirm reward settlement.");
+      if (showClaimsPanel) {
+        setClaimsError(err.message || "Could not confirm reward settlement.");
+      }
+    } finally {
+      setRewardActionItemId("");
+    }
+  }
+
   async function handleSubmit(event) {
     event.preventDefault();
     setError("");
     setNotice("");
+    setImageUploadError("");
 
     if (!auth?.token) {
       setError("Please sign in before submitting a report.");
       return;
+    }
+
+    const payload = {
+      title: form.title,
+      description: form.description,
+      category: form.category,
+      type: form.type,
+      location: form.location,
+      itemDate: form.itemDate,
+    };
+
+    if (form.type === "LOST" && String(form.rewardInr || "").trim() !== "") {
+      const parsedInr = Number(form.rewardInr);
+      if (
+        !Number.isFinite(parsedInr) ||
+        parsedInr < 1 ||
+        parsedInr > MAX_REWARD_INR
+      ) {
+        setError(
+          `Optional reward must be between ₹1 and ₹${MAX_REWARD_INR.toLocaleString("en-IN")}.`
+        );
+        return;
+      }
+      payload.rewardAmountPaise = Math.round(parsedInr * 100);
+      payload.rewardCurrency = "INR";
     }
 
     setSubmitting(true);
@@ -1285,7 +1768,7 @@ async function loadMyReports() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${auth.token}`,
         },
-        body: JSON.stringify(form),
+        body: JSON.stringify(payload),
       });
 
       const data = await response.json().catch(() => null);
@@ -1294,11 +1777,56 @@ async function loadMyReports() {
         throw new Error(data?.message || "Could not submit report.");
       }
 
+      let photoNotice = "";
+      let photoUploadFailed = false;
+      if (pendingImages.length > 0 && data.item?._id) {
+        const formData = new FormData();
+        for (const img of pendingImages) {
+          if (img.file) {
+            formData.append("images", img.file, img.name);
+            formData.append("visibilities", img.visibility || "PUBLIC");
+          }
+        }
+
+        const uploadRes = await fetch(
+          `${API_URL}/api/items/${data.item._id}/images`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${auth.token}`,
+            },
+            body: formData,
+          }
+        );
+        const uploadData = await uploadRes.json().catch(() => null);
+        if (!uploadRes.ok || !uploadData?.success) {
+          photoUploadFailed = true;
+          const uploadErrMsg =
+            uploadData?.message ||
+            "Report was created, but photo upload could not be completed.";
+          setImageUploadError(uploadErrMsg);
+          setError(uploadErrMsg);
+        } else {
+          photoNotice = ` (${pendingImages.length} photo${
+            pendingImages.length === 1 ? "" : "s"
+          } attached)`;
+          if (uploadData.item) {
+            setItemDetailById((prev) => ({
+              ...prev,
+              [data.item._id]: uploadData.item,
+            }));
+          }
+        }
+      }
+
       const xpBonus =
         data.reward?.awarded && data.reward?.pointsAwarded > 0
           ? ` (+${data.reward.pointsAwarded} XP earned!)`
           : "";
-      setNotice(`Report submitted successfully!${xpBonus}`);
+      if (!photoUploadFailed) {
+        setNotice(`Report submitted successfully!${photoNotice}${xpBonus}`);
+        setPendingImages([]);
+      }
       setForm(createEmptyForm());
       setMatchesByItem({});
 
@@ -1436,6 +1964,13 @@ async function handleDelete(itemId) {
     const formattedDate = item.itemDate
       ? new Date(item.itemDate).toISOString().slice(0, 10)
       : getToday();
+    const existingRewardInr =
+      item.type === "LOST" &&
+      typeof item.rewardAmountPaise === "number" &&
+      item.rewardAmountPaise > 0 &&
+      item.rewardStatus === "OFFERED"
+        ? String(item.rewardAmountPaise / 100)
+        : "";
     setEditForm({
       title: item.title || "",
       description: item.description || "",
@@ -1443,6 +1978,7 @@ async function handleDelete(itemId) {
       type: item.type || "LOST",
       location: item.location || "",
       itemDate: formattedDate,
+      rewardInr: existingRewardInr,
     });
   }
 
@@ -1472,6 +2008,36 @@ async function handleDelete(itemId) {
       return;
     }
 
+    const patchPayload = {
+      title: trimmedTitle,
+      description: trimmedDescription,
+      category: editForm.category,
+      type: editForm.type,
+      location: trimmedLocation,
+      itemDate: editForm.itemDate,
+    };
+
+    if (editForm.type === "LOST") {
+      const rawReward = String(editForm.rewardInr || "").trim();
+      if (rawReward === "" || rawReward === "0") {
+        patchPayload.rewardAmountPaise = 0;
+      } else {
+        const parsedInr = Number(rawReward);
+        if (
+          !Number.isFinite(parsedInr) ||
+          parsedInr < 1 ||
+          parsedInr > MAX_REWARD_INR
+        ) {
+          setError(
+            `Reward amount must be between ₹1 and ₹${MAX_REWARD_INR.toLocaleString("en-IN")}.`
+          );
+          return;
+        }
+        patchPayload.rewardAmountPaise = Math.round(parsedInr * 100);
+        patchPayload.rewardCurrency = "INR";
+      }
+    }
+
     setEditSubmitting(true);
     setError("");
     setNotice("");
@@ -1483,14 +2049,7 @@ async function handleDelete(itemId) {
           "Content-Type": "application/json",
           Authorization: `Bearer ${auth.token}`,
         },
-        body: JSON.stringify({
-          title: trimmedTitle,
-          description: trimmedDescription,
-          category: editForm.category,
-          type: editForm.type,
-          location: trimmedLocation,
-          itemDate: editForm.itemDate,
-        }),
+        body: JSON.stringify(patchPayload),
       });
 
       const data = await response.json().catch(() => null);
@@ -1499,6 +2058,9 @@ async function handleDelete(itemId) {
         throw new Error(data?.message || "Could not update report.");
       }
 
+      if (data.item) {
+        setItemDetailById((prev) => ({ ...prev, [itemId]: data.item }));
+      }
       setEditingItemId("");
       setMatchesByItem({});
       await loadItems();
@@ -1514,10 +2076,14 @@ async function handleDelete(itemId) {
   }
 
   function toggleItemDetails(itemId) {
+    const nextExpanded = !expandedItemIds[itemId];
     setExpandedItemIds((prev) => ({
       ...prev,
-      [itemId]: !prev[itemId],
+      [itemId]: nextExpanded,
     }));
+    if (nextExpanded) {
+      fetchItemDetail(itemId, auth?.token);
+    }
   }
 
   function getUserInitials(name) {
@@ -2121,13 +2687,26 @@ async function handleDelete(itemId) {
               <div className="recent-cards-grid">
                 {recentPreviewItems.map((item) => {
                   const isFound = item.type === "FOUND";
+                  const rewardMeta = getRewardBadgeMeta(item);
+                  const firstPublicImg = Array.isArray(item.images)
+                    ? item.images.find((img) => img && img.url)
+                    : null;
                   return (
                     <article className="recent-item-card" key={`recent-${item._id}`}>
                       <div
                         className="recent-card-illustration"
                         aria-hidden="true"
                       >
-                        {getCategoryIcon(item.category, item.title)}
+                        {firstPublicImg ? (
+                          <img
+                            src={firstPublicImg.url}
+                            alt=""
+                            className="recent-card-photo-thumb"
+                            loading="lazy"
+                          />
+                        ) : (
+                          getCategoryIcon(item.category, item.title)
+                        )}
                       </div>
 
                       <div className="recent-card-body">
@@ -2145,6 +2724,14 @@ async function handleDelete(itemId) {
                               className={`item-status status-${item.status.toLowerCase()}`}
                             >
                               {item.status.replace("_", " ")}
+                            </span>
+                          )}
+
+                          {rewardMeta && (
+                            <span
+                              className={`monetary-reward-pill ${rewardMeta.statusClass}`}
+                            >
+                              {rewardMeta.formatted} · {rewardMeta.statusText}
                             </span>
                           )}
                         </div>
@@ -2826,7 +3413,8 @@ async function handleDelete(itemId) {
                 {notifications.map((notif) => {
                   const typeClass =
                     notif.type === "CLAIM_APPROVED" ||
-                    notif.type === "ITEM_RETURNED"
+                    notif.type === "ITEM_RETURNED" ||
+                    notif.type === "REWARD_SETTLED"
                       ? "approved"
                       : notif.type === "CLAIM_REJECTED" ||
                           notif.type === "REPORT_MODERATED"
@@ -2843,7 +3431,11 @@ async function handleDelete(itemId) {
                             ? "ITEM RETURNED"
                             : notif.type === "REPORT_MODERATED"
                               ? "REPORT MODERATED"
-                              : "UPDATE";
+                              : notif.type === "REWARD_SETTLEMENT_PENDING"
+                                ? "REWARD SETTLEMENT PENDING"
+                                : notif.type === "REWARD_SETTLED"
+                                  ? "REWARD SETTLED"
+                                  : "UPDATE";
 
                   return (
                     <article
@@ -2973,36 +3565,132 @@ async function handleDelete(itemId) {
                     </div>
                   ) : (
                     <div className="item-list">
-                      {myClaims.map((claim) => (
-                        <article className="item-card claim-card" key={claim._id}>
-                          <div className="item-content">
-                            <div className="item-card-top">
-                              <span
-                                className={`claim-status-badge ${claim.status.toLowerCase()}`}
-                              >
-                                {claim.status}
-                              </span>
-                              <span className="item-status">
-                                Item: {claim.item?.status || "N/A"}
-                              </span>
-                            </div>
+                      {myClaims.map((claim) => {
+                        const targetRewardItem =
+                          claim.linkedLostItem?.rewardAmountPaise > 0
+                            ? claim.linkedLostItem
+                            : claim.item?.rewardAmountPaise > 0
+                              ? claim.item
+                              : null;
+                        const claimRewardMeta = getRewardBadgeMeta(targetRewardItem);
+                        return (
+                          <article className="item-card claim-card" key={claim._id}>
+                            <div className="item-content">
+                              <div className="item-card-top">
+                                <div className="badge-group">
+                                  <span
+                                    className={`claim-status-badge ${claim.status.toLowerCase()}`}
+                                  >
+                                    {claim.status}
+                                  </span>
+                                  {claimRewardMeta && (
+                                    <span
+                                      className={`monetary-reward-pill ${claimRewardMeta.statusClass}`}
+                                    >
+                                      {claimRewardMeta.label}
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="item-status">
+                                  Item: {claim.item?.status || "N/A"}
+                                </span>
+                              </div>
 
-                            <h3>{claim.item?.title || "Report unavailable"}</h3>
+                              <h3>{claim.item?.title || "Report unavailable"}</h3>
 
-                            <p className="claim-proof-box">
-                              <strong>Your verification details:</strong>{" "}
-                              {claim.proofDescription}
-                            </p>
-
-                            {claim.reviewNote && (
-                              <p className="claim-review-note">
-                                <strong>Reviewer note:</strong>{" "}
-                                {claim.reviewNote}
+                              <p className="claim-proof-box">
+                                <strong>Your verification details:</strong>{" "}
+                                {claim.proofDescription}
                               </p>
-                            )}
-                          </div>
-                        </article>
-                      ))}
+
+                              {claim.reviewNote && (
+                                <p className="claim-review-note">
+                                  <strong>Reviewer note:</strong>{" "}
+                                  {claim.reviewNote}
+                                </p>
+                              )}
+
+                              {targetRewardItem &&
+                                (targetRewardItem.rewardStatus ===
+                                  "SETTLEMENT_PENDING" ||
+                                  targetRewardItem.rewardStatus === "SETTLED") && (
+                                  <div className="reward-settlement-box">
+                                    <div className="reward-settlement-header">
+                                      <strong>
+                                        Voluntary Monetary Reward Settlement (
+                                        {formatInrFromPaise(
+                                          targetRewardItem.rewardAmountPaise
+                                        )}
+                                        )
+                                      </strong>
+                                      <span
+                                        className={`monetary-reward-pill ${
+                                          targetRewardItem.rewardStatus ===
+                                          "SETTLED"
+                                            ? "reward-settled"
+                                            : "reward-pending"
+                                        }`}
+                                      >
+                                        {targetRewardItem.rewardStatus ===
+                                        "SETTLED"
+                                          ? "SETTLED"
+                                          : "SETTLEMENT PENDING"}
+                                      </span>
+                                    </div>
+                                    <p className="reward-disclaimer-text">
+                                      LostLink does not hold funds or process
+                                      payments. Both the owner and finder must
+                                      confirm after direct handover.
+                                    </p>
+                                    <div className="reward-confirmation-status">
+                                      <span>
+                                        Owner Confirmed:{" "}
+                                        <strong>
+                                          {targetRewardItem.rewardSettlement
+                                            ?.ownerConfirmedAt
+                                            ? "✓ Confirmed"
+                                            : "Pending"}
+                                        </strong>
+                                      </span>
+                                      <span>
+                                        Finder Confirmed:{" "}
+                                        <strong>
+                                          {targetRewardItem.rewardSettlement
+                                            ?.finderConfirmedAt
+                                            ? "✓ Confirmed"
+                                            : "Pending"}
+                                        </strong>
+                                      </span>
+                                    </div>
+                                    {targetRewardItem.rewardStatus ===
+                                      "SETTLEMENT_PENDING" && (
+                                      <div className="item-actions">
+                                        <button
+                                          type="button"
+                                          className="action-button approve-button"
+                                          disabled={
+                                            rewardActionItemId ===
+                                            targetRewardItem._id
+                                          }
+                                          onClick={() =>
+                                            handleConfirmRewardSettlement(
+                                              targetRewardItem._id
+                                            )
+                                          }
+                                        >
+                                          {rewardActionItemId ===
+                                          targetRewardItem._id
+                                            ? "Confirming..."
+                                            : "Confirm Reward Settlement"}
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                            </div>
+                          </article>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -3035,6 +3723,14 @@ async function handleDelete(itemId) {
                           claimantId !== auth.user.id &&
                           claim.item?.status !== "CLOSED" &&
                           !claim.item?.moderated;
+                        const targetRewardItem =
+                          claim.linkedLostItem?.rewardAmountPaise > 0
+                            ? claim.linkedLostItem
+                            : claim.item?.rewardAmountPaise > 0
+                              ? claim.item
+                              : null;
+                        const receivedRewardMeta =
+                          getRewardBadgeMeta(targetRewardItem);
 
                         return (
                           <article
@@ -3043,11 +3739,20 @@ async function handleDelete(itemId) {
                           >
                             <div className="item-content">
                               <div className="item-card-top">
-                                <span
-                                  className={`claim-status-badge ${claim.status.toLowerCase()}`}
-                                >
-                                  {claim.status}
-                                </span>
+                                <div className="badge-group">
+                                  <span
+                                    className={`claim-status-badge ${claim.status.toLowerCase()}`}
+                                  >
+                                    {claim.status}
+                                  </span>
+                                  {receivedRewardMeta && (
+                                    <span
+                                      className={`monetary-reward-pill ${receivedRewardMeta.statusClass}`}
+                                    >
+                                      {receivedRewardMeta.label}
+                                    </span>
+                                  )}
+                                </div>
                                 <span className="item-status">
                                   Item: {claim.item?.status || "N/A"}
                                 </span>
@@ -3075,6 +3780,85 @@ async function handleDelete(itemId) {
                                   {claim.reviewNote}
                                 </p>
                               )}
+
+                              {targetRewardItem &&
+                                (targetRewardItem.rewardStatus ===
+                                  "SETTLEMENT_PENDING" ||
+                                  targetRewardItem.rewardStatus ===
+                                    "SETTLED") && (
+                                  <div className="reward-settlement-box">
+                                    <div className="reward-settlement-header">
+                                      <strong>
+                                        Voluntary Monetary Reward Settlement (
+                                        {formatInrFromPaise(
+                                          targetRewardItem.rewardAmountPaise
+                                        )}
+                                        )
+                                      </strong>
+                                      <span
+                                        className={`monetary-reward-pill ${
+                                          targetRewardItem.rewardStatus ===
+                                          "SETTLED"
+                                            ? "reward-settled"
+                                            : "reward-pending"
+                                        }`}
+                                      >
+                                        {targetRewardItem.rewardStatus ===
+                                        "SETTLED"
+                                          ? "SETTLED"
+                                          : "SETTLEMENT PENDING"}
+                                      </span>
+                                    </div>
+                                    <p className="reward-disclaimer-text">
+                                      LostLink does not hold funds or process
+                                      payments. Both the owner and finder must
+                                      confirm after direct handover.
+                                    </p>
+                                    <div className="reward-confirmation-status">
+                                      <span>
+                                        Owner Confirmed:{" "}
+                                        <strong>
+                                          {targetRewardItem.rewardSettlement
+                                            ?.ownerConfirmedAt
+                                            ? "✓ Confirmed"
+                                            : "Pending"}
+                                        </strong>
+                                      </span>
+                                      <span>
+                                        Finder Confirmed:{" "}
+                                        <strong>
+                                          {targetRewardItem.rewardSettlement
+                                            ?.finderConfirmedAt
+                                            ? "✓ Confirmed"
+                                            : "Pending"}
+                                        </strong>
+                                      </span>
+                                    </div>
+                                    {targetRewardItem.rewardStatus ===
+                                      "SETTLEMENT_PENDING" && (
+                                      <div className="item-actions">
+                                        <button
+                                          type="button"
+                                          className="action-button approve-button"
+                                          disabled={
+                                            rewardActionItemId ===
+                                            targetRewardItem._id
+                                          }
+                                          onClick={() =>
+                                            handleConfirmRewardSettlement(
+                                              targetRewardItem._id
+                                            )
+                                          }
+                                        >
+                                          {rewardActionItemId ===
+                                          targetRewardItem._id
+                                            ? "Confirming..."
+                                            : "Confirm Reward Settlement"}
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
 
                               {canReview && (
                                 <div className="item-actions">
@@ -3476,7 +4260,12 @@ async function handleDelete(itemId) {
 
             {!adminLoading && !adminUnauthorized && adminItems.length > 0 && (
               <div className="item-list">
-                {adminItems.map((item) => (
+                {adminItems.map((item) => {
+                  const adminRewardMeta = getRewardBadgeMeta(item);
+                  const adminPhotoCount = Array.isArray(item.images)
+                    ? item.images.length
+                    : 0;
+                  return (
                   <article
                     className={`item-card ${
                       item.moderated ? "moderated-card" : ""
@@ -3498,6 +4287,20 @@ async function handleDelete(itemId) {
                               : "FOUND ITEM"}
                           </span>
 
+                          {adminRewardMeta && (
+                            <span
+                              className={`monetary-reward-pill ${adminRewardMeta.statusClass}`}
+                            >
+                              {adminRewardMeta.label}
+                            </span>
+                          )}
+
+                          {adminPhotoCount > 0 && (
+                            <span className="photo-count-pill">
+                              📷 {adminPhotoCount} photo{adminPhotoCount === 1 ? "" : "s"}
+                            </span>
+                          )}
+
                           {item.moderated && (
                             <span className="moderated-badge">
                               MODERATED / HIDDEN
@@ -3513,6 +4316,34 @@ async function handleDelete(itemId) {
                       <p className="item-description">
                         {item.description}
                       </p>
+
+                      {adminPhotoCount > 0 && (
+                        <div className="item-photo-strip" aria-label="Report photos">
+                          {item.images.map((img, idx) => (
+                            <button
+                              key={img._id || idx}
+                              type="button"
+                              className="photo-thumb-btn"
+                              onClick={() =>
+                                setActiveLightboxImage({
+                                  url: img.url,
+                                  title: item.title,
+                                  visibility: img.visibility || "PUBLIC",
+                                })
+                              }
+                            >
+                              <img
+                                src={img.url}
+                                alt={`${item.title} attachment ${idx + 1}`}
+                                loading="lazy"
+                              />
+                              {img.visibility === "PRIVATE" && (
+                                <span className="private-photo-tag">PRIVATE</span>
+                              )}
+                            </button>
+                          ))}
+                        </div>
+                      )}
 
                       <div className="item-meta">
                         <span>⌖ {item.location}</span>
@@ -3586,7 +4417,8 @@ async function handleDelete(itemId) {
                       </div>
                     </div>
                   </article>
-                ))}
+                  );
+                })}
               </div>
             )}
           </section>
@@ -3629,7 +4461,11 @@ async function handleDelete(itemId) {
                         form.type === "FOUND" ? "active" : ""
                       }`}
                       onClick={() =>
-                        setForm((prev) => ({ ...prev, type: "FOUND" }))
+                        setForm((prev) => ({
+                          ...prev,
+                          type: "FOUND",
+                          rewardInr: "",
+                        }))
                       }
                     >
                       ✓ I found something
@@ -3711,6 +4547,109 @@ async function handleDelete(itemId) {
                     max={getToday()}
                     required
                   />
+
+                  {form.type === "LOST" && (
+                    <div className="reward-offer-fieldset">
+                      <label htmlFor="rewardInr">
+                        Optional Monetary Reward (INR ₹)
+                      </label>
+                      <input
+                        id="rewardInr"
+                        name="rewardInr"
+                        type="number"
+                        min={1}
+                        max={MAX_REWARD_INR}
+                        step="1"
+                        value={form.rewardInr}
+                        onChange={handleChange}
+                        placeholder="Optional reward in ₹ (e.g. 500)"
+                      />
+                      <small className="reward-disclaimer-text">
+                        Voluntary reward offer in INR. LostLink does not hold
+                        funds, implement escrow, or process payments; settlement
+                        is confirmed mutually after verified handover.
+                      </small>
+                    </div>
+                  )}
+
+                  <div className="photo-upload-fieldset">
+                    <div className="photo-upload-header">
+                      <label htmlFor="report-photos">
+                        Item Photos (Optional · up to {MAX_IMAGES_PER_ITEM} photos)
+                      </label>
+                      <span className="photo-count-hint">
+                        {pendingImages.length} / {MAX_IMAGES_PER_ITEM} selected
+                      </span>
+                    </div>
+                    <input
+                      id="report-photos"
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      multiple
+                      disabled={
+                        submitting || pendingImages.length >= MAX_IMAGES_PER_ITEM
+                      }
+                      onChange={handleSelectPendingImages}
+                    />
+                    <small className="photo-upload-hint">
+                      JPEG, PNG, or WebP · Max 5 MB per photo. EXIF/GPS metadata
+                      is automatically stripped before cloud storage. Mark
+                      sensitive proof photos as{" "}
+                      <strong>Private (Ownership Evidence)</strong>.
+                    </small>
+
+                    {imageUploadError && (
+                      <p className="message error-message" role="alert">
+                        {imageUploadError}
+                      </p>
+                    )}
+
+                    {pendingImages.length > 0 && (
+                      <div className="pending-photo-grid">
+                        {pendingImages.map((img) => (
+                          <div className="pending-photo-card" key={img.id}>
+                            <img
+                              src={img.dataUrl}
+                              alt={img.name}
+                              className="pending-photo-thumb"
+                            />
+                            <div className="pending-photo-controls">
+                              <span
+                                className="pending-photo-name"
+                                title={img.name}
+                              >
+                                {img.name}
+                              </span>
+                              <select
+                                aria-label={`Visibility for ${img.name}`}
+                                value={img.visibility}
+                                onChange={(e) =>
+                                  handlePendingImageVisibilityChange(
+                                    img.id,
+                                    e.target.value
+                                  )
+                                }
+                              >
+                                <option value="PUBLIC">
+                                  Public (General listing)
+                                </option>
+                                <option value="PRIVATE">
+                                  Private (Ownership evidence)
+                                </option>
+                              </select>
+                              <button
+                                type="button"
+                                className="photo-remove-btn"
+                                onClick={() => handleRemovePendingImage(img.id)}
+                              >
+                                ✕ Remove
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
 
                   {error && (
                     <p className="message error-message" role="alert">
@@ -4013,7 +4952,9 @@ async function handleDelete(itemId) {
             )}
 
             <div className="item-list">
-              {displayedItems.map((item) => {
+              {displayedItems.map((baseItem) => {
+                const enriched = itemDetailById[baseItem._id];
+                const item = enriched ? { ...baseItem, ...enriched } : baseItem;
                 // reportedBy arrives as a raw ObjectId string from GET /api/items
                 // (the route does not populate the field). Compare as strings.
                 const reportedById =
@@ -4024,11 +4965,16 @@ async function handleDelete(itemId) {
                   auth !== null &&
                   reportedById !== "" &&
                   reportedById === auth.user.id;
+                const isAdminUser = auth?.user?.role === "admin";
                 const canModify = isOwner && item.status === "OPEN";
+                const canManagePhotosOrReward =
+                  (isOwner || isAdminUser) && item.status === "OPEN";
                 const canClaim =
                   auth !== null &&
                   !isOwner &&
-                  item.type === "FOUND" &&
+                  (item.type === "FOUND" ||
+                    (item.type === "LOST" &&
+                      item.rewardStatus === "OFFERED")) &&
                   (item.status === "OPEN" ||
                     item.status === "CLAIM_PENDING");
                 const canFindMatches =
@@ -4041,6 +4987,10 @@ async function handleDelete(itemId) {
                 const itemMatchState = matchesByItem[item._id];
                 const isExpanded = Boolean(expandedItemIds[item._id]);
                 const isEditing = editingItemId === item._id;
+                const rewardMeta = getRewardBadgeMeta(item);
+                const visibleImages = Array.isArray(item.images)
+                  ? item.images.filter((img) => img && img.url)
+                  : [];
 
                 return (
                   <article
@@ -4070,6 +5020,21 @@ async function handleDelete(itemId) {
                             {item.category}
                           </span>
 
+                          {rewardMeta && (
+                            <span
+                              className={`monetary-reward-pill ${rewardMeta.statusClass}`}
+                            >
+                              {rewardMeta.label}
+                            </span>
+                          )}
+
+                          {visibleImages.length > 0 && (
+                            <span className="photo-count-pill">
+                              📷 {visibleImages.length} photo
+                              {visibleImages.length === 1 ? "" : "s"}
+                            </span>
+                          )}
+
                           {isOwner && (
                             <span className="owner-pill">YOUR REPORT</span>
                           )}
@@ -4087,6 +5052,39 @@ async function handleDelete(itemId) {
                       <p className="item-description">
                         {item.description}
                       </p>
+
+                      {visibleImages.length > 0 && !isExpanded && (
+                        <div
+                          className="item-photo-strip"
+                          aria-label={`Photos for ${item.title}`}
+                        >
+                          {visibleImages.map((img, idx) => (
+                            <button
+                              key={img._id || idx}
+                              type="button"
+                              className="photo-thumb-btn"
+                              onClick={() =>
+                                setActiveLightboxImage({
+                                  url: img.url,
+                                  title: item.title,
+                                  visibility: img.visibility || "PUBLIC",
+                                })
+                              }
+                            >
+                              <img
+                                src={img.url}
+                                alt={`${item.title} photo ${idx + 1}`}
+                                loading="lazy"
+                              />
+                              {img.visibility === "PRIVATE" && (
+                                <span className="private-photo-tag">
+                                  PRIVATE
+                                </span>
+                              )}
+                            </button>
+                          ))}
+                        </div>
+                      )}
 
                       <div className="item-meta">
                         <span className="meta-chip">
@@ -4148,6 +5146,282 @@ async function handleDelete(itemId) {
                               </strong>
                             </div>
                           </div>
+
+                          {/* Photo Gallery & Owner/Admin Photo Management */}
+                          <div className="detail-gallery-section">
+                            <div className="detail-section-header">
+                              <strong>
+                                Report Photos ({visibleImages.length}/
+                                {MAX_IMAGES_PER_ITEM})
+                              </strong>
+                              {(isOwner || isAdminUser) && (
+                                <span className="detail-sub-caption">
+                                  Private photos are hidden from the public and
+                                  visible only to you and administrators.
+                                </span>
+                              )}
+                            </div>
+
+                            {visibleImages.length === 0 ? (
+                              <p className="detail-empty-note">
+                                No photos attached to this report yet.
+                              </p>
+                            ) : (
+                              <div className="detail-photo-gallery">
+                                {visibleImages.map((img, idx) => (
+                                  <div
+                                    className="detail-photo-card"
+                                    key={img._id || idx}
+                                  >
+                                    <button
+                                      type="button"
+                                      className="detail-photo-preview-btn"
+                                      onClick={() =>
+                                        setActiveLightboxImage({
+                                          url: img.url,
+                                          title: item.title,
+                                          visibility:
+                                            img.visibility || "PUBLIC",
+                                        })
+                                      }
+                                    >
+                                      <img
+                                        src={img.url}
+                                        alt={`${item.title} attachment ${
+                                          idx + 1
+                                        }`}
+                                        loading="lazy"
+                                      />
+                                    </button>
+                                    <div className="detail-photo-meta">
+                                      <span
+                                        className={`photo-visibility-badge ${
+                                          img.visibility === "PRIVATE"
+                                            ? "private"
+                                            : "public"
+                                        }`}
+                                      >
+                                        {img.visibility === "PRIVATE"
+                                          ? "PRIVATE EVIDENCE"
+                                          : "PUBLIC"}
+                                      </span>
+                                      {canManagePhotosOrReward && img._id && (
+                                        <div className="detail-photo-actions">
+                                          <button
+                                            type="button"
+                                            className="mini-action-btn"
+                                            disabled={
+                                              uploadingImagesForId === item._id
+                                            }
+                                            onClick={() =>
+                                              handleToggleExistingImageVisibility(
+                                                item._id,
+                                                img._id,
+                                                img.visibility
+                                              )
+                                            }
+                                          >
+                                            Make{" "}
+                                            {img.visibility === "PRIVATE"
+                                              ? "Public"
+                                              : "Private"}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="mini-action-btn danger"
+                                            disabled={
+                                              uploadingImagesForId === item._id
+                                            }
+                                            onClick={() =>
+                                              handleDeleteExistingImage(
+                                                item._id,
+                                                img._id
+                                              )
+                                            }
+                                          >
+                                            Delete
+                                          </button>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            {canManagePhotosOrReward &&
+                              visibleImages.length < MAX_IMAGES_PER_ITEM && (
+                                <div className="detail-add-photos-row">
+                                  <label
+                                    htmlFor={`add-photos-${item._id}`}
+                                    className="action-button edit-button file-label-btn"
+                                  >
+                                    {uploadingImagesForId === item._id
+                                      ? "Uploading..."
+                                      : `+ Add Photos (${
+                                          MAX_IMAGES_PER_ITEM -
+                                          visibleImages.length
+                                        } remaining)`}
+                                  </label>
+                                  <input
+                                    id={`add-photos-${item._id}`}
+                                    type="file"
+                                    accept="image/jpeg,image/png,image/webp"
+                                    multiple
+                                    style={{ display: "none" }}
+                                    disabled={uploadingImagesForId === item._id}
+                                    onChange={(e) => {
+                                      const files = e.target.files;
+                                      e.target.value = "";
+                                      handleUploadImagesToExistingItem(
+                                        item._id,
+                                        files,
+                                        "PUBLIC"
+                                      );
+                                    }}
+                                  />
+                                </div>
+                              )}
+                          </div>
+
+                          {/* Voluntary Monetary Reward & Settlement Section */}
+                          {item.type === "LOST" && (
+                            <div className="detail-reward-section">
+                              <div className="detail-section-header">
+                                <strong>Voluntary Monetary Reward (INR)</strong>
+                                {rewardMeta ? (
+                                  <span
+                                    className={`monetary-reward-pill ${rewardMeta.statusClass}`}
+                                  >
+                                    {rewardMeta.label}
+                                  </span>
+                                ) : (
+                                  <span className="detail-sub-caption">
+                                    No monetary reward offered
+                                  </span>
+                                )}
+                              </div>
+
+                              <p className="reward-disclaimer-text">
+                                Voluntary reward agreement in INR. LostLink does
+                                not hold funds, implement escrow, or process
+                                payments; settlement is confirmed mutually after
+                                verified item handover.
+                              </p>
+
+                              {canManagePhotosOrReward && (
+                                <div className="reward-manage-controls">
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    max={MAX_REWARD_INR}
+                                    step="1"
+                                    placeholder={
+                                      item.rewardAmountPaise > 0
+                                        ? `Current: ₹${
+                                            item.rewardAmountPaise / 100
+                                          }`
+                                        : "Enter reward in ₹ (e.g. 500)"
+                                    }
+                                    value={
+                                      rewardEditInputs[item._id] !== undefined
+                                        ? rewardEditInputs[item._id]
+                                        : item.rewardAmountPaise > 0
+                                          ? String(item.rewardAmountPaise / 100)
+                                          : ""
+                                    }
+                                    onChange={(e) =>
+                                      setRewardEditInputs((prev) => ({
+                                        ...prev,
+                                        [item._id]: e.target.value,
+                                      }))
+                                    }
+                                  />
+                                  <button
+                                    type="button"
+                                    className="action-button edit-button"
+                                    disabled={rewardActionItemId === item._id}
+                                    onClick={() =>
+                                      handleUpdateItemReward(item._id, {
+                                        amountInr:
+                                          rewardEditInputs[item._id] !==
+                                          undefined
+                                            ? rewardEditInputs[item._id]
+                                            : item.rewardAmountPaise > 0
+                                              ? item.rewardAmountPaise / 100
+                                              : "",
+                                      })
+                                    }
+                                  >
+                                    {rewardActionItemId === item._id
+                                      ? "Saving..."
+                                      : item.rewardStatus === "OFFERED"
+                                        ? "Update Reward Offer"
+                                        : "Offer Reward"}
+                                  </button>
+                                  {item.rewardStatus === "OFFERED" && (
+                                    <button
+                                      type="button"
+                                      className="action-button delete-button"
+                                      disabled={rewardActionItemId === item._id}
+                                      onClick={() =>
+                                        handleUpdateItemReward(item._id, {
+                                          cancel: true,
+                                        })
+                                      }
+                                    >
+                                      Cancel Reward
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+
+                              {(item.rewardStatus === "SETTLEMENT_PENDING" ||
+                                item.rewardStatus === "SETTLED") && (
+                                <div className="reward-settlement-box">
+                                  <div className="reward-confirmation-status">
+                                    <span>
+                                      Owner Confirmed:{" "}
+                                      <strong>
+                                        {item.rewardSettlement?.ownerConfirmedAt
+                                          ? "✓ Confirmed"
+                                          : "Pending"}
+                                      </strong>
+                                    </span>
+                                    <span>
+                                      Finder Confirmed:{" "}
+                                      <strong>
+                                        {item.rewardSettlement?.finderConfirmedAt
+                                          ? "✓ Confirmed"
+                                          : "Pending"}
+                                      </strong>
+                                    </span>
+                                  </div>
+                                  {item.rewardStatus === "SETTLEMENT_PENDING" &&
+                                    auth && (
+                                      <div className="item-actions">
+                                        <button
+                                          type="button"
+                                          className="action-button approve-button"
+                                          disabled={
+                                            rewardActionItemId === item._id
+                                          }
+                                          onClick={() =>
+                                            handleConfirmRewardSettlement(
+                                              item._id
+                                            )
+                                          }
+                                        >
+                                          {rewardActionItemId === item._id
+                                            ? "Confirming..."
+                                            : "Confirm Reward Settlement"}
+                                        </button>
+                                      </div>
+                                    )}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -4225,6 +5499,25 @@ async function handleDelete(itemId) {
                             </div>
                           </div>
 
+                          {editForm.type === "LOST" && (
+                            <div>
+                              <label htmlFor={`edit-reward-${item._id}`}>
+                                Optional Monetary Reward (INR ₹ · leave blank or 0 to cancel)
+                              </label>
+                              <input
+                                id={`edit-reward-${item._id}`}
+                                name="rewardInr"
+                                type="number"
+                                min={0}
+                                max={MAX_REWARD_INR}
+                                step="1"
+                                value={editForm.rewardInr}
+                                onChange={handleEditFormChange}
+                                placeholder="e.g. 500"
+                              />
+                            </div>
+                          )}
+
                           <div>
                             <label htmlFor={`edit-desc-${item._id}`}>
                               Description
@@ -4296,9 +5589,9 @@ async function handleDelete(itemId) {
                               }
                             >
                               <label htmlFor={`claim-proof-${item._id}`}>
-                                Describe unique identifying details to verify
-                                ownership (do not share passwords or sensitive
-                                ID numbers):
+                                {item.type === "LOST"
+                                  ? "Describe where/when you found this item and identifying details for handover:"
+                                  : "Describe unique identifying details to verify ownership (do not share passwords or sensitive ID numbers):"}
                               </label>
                               <textarea
                                 id={`claim-proof-${item._id}`}
@@ -4312,6 +5605,54 @@ async function handleDelete(itemId) {
                                   setClaimProofText(e.target.value)
                                 }
                               />
+                              {item.type === "FOUND" &&
+                                myItems.some(
+                                  (mi) =>
+                                    mi.type === "LOST" &&
+                                    mi.status === "OPEN" &&
+                                    !mi.moderated
+                                ) && (
+                                  <div className="claim-link-lost-row">
+                                    <label
+                                      htmlFor={`claim-link-lost-${item._id}`}
+                                    >
+                                      Link one of your open LOST reports
+                                      (optional · required if settling a LOST
+                                      report reward):
+                                    </label>
+                                    <select
+                                      id={`claim-link-lost-${item._id}`}
+                                      value={claimLinkedLostItemId}
+                                      onChange={(e) =>
+                                        setClaimLinkedLostItemId(
+                                          e.target.value
+                                        )
+                                      }
+                                    >
+                                      <option value="">
+                                        None (standard ownership claim)
+                                      </option>
+                                      {myItems
+                                        .filter(
+                                          (mi) =>
+                                            mi.type === "LOST" &&
+                                            mi.status === "OPEN" &&
+                                            !mi.moderated
+                                        )
+                                        .map((mi) => (
+                                          <option key={mi._id} value={mi._id}>
+                                            {mi.title}
+                                            {mi.rewardStatus === "OFFERED" &&
+                                            mi.rewardAmountPaise > 0
+                                              ? ` (Reward: ${formatInrFromPaise(
+                                                  mi.rewardAmountPaise
+                                                )})`
+                                              : ""}
+                                          </option>
+                                        ))}
+                                    </select>
+                                  </div>
+                                )}
                               {error && (
                                 <p
                                   className="message error-message"
@@ -4336,6 +5677,7 @@ async function handleDelete(itemId) {
                                   onClick={() => {
                                     setClaimingItemId("");
                                     setClaimProofText("");
+                                    setClaimLinkedLostItemId("");
                                   }}
                                 >
                                   Cancel
@@ -4350,11 +5692,17 @@ async function handleDelete(itemId) {
                                 onClick={() => {
                                   setClaimingItemId(item._id);
                                   setClaimProofText("");
+                                  setClaimLinkedLostItemId("");
                                   setError("");
                                   setNotice("");
+                                  if (auth?.token && myItems.length === 0) {
+                                    fetchMyItems().catch(() => {});
+                                  }
                                 }}
                               >
-                                Claim this item
+                                {item.type === "LOST"
+                                  ? "I found this · Submit return claim"
+                                  : "Claim this item"}
                               </button>
                             </div>
                           )}
@@ -4471,6 +5819,13 @@ async function handleDelete(itemId) {
                                   <div className="matches-list">
                                     {itemMatchState.matches.map((matchEntry) => {
                                       const candidate = matchEntry.item || {};
+                                      const candidateRewardMeta =
+                                        getRewardBadgeMeta(candidate);
+                                      const candidatePhotos = Array.isArray(
+                                        candidate.images
+                                      )
+                                        ? candidate.images
+                                        : [];
                                       const score =
                                         typeof matchEntry.matchScore ===
                                         "number"
@@ -4507,6 +5862,22 @@ async function handleDelete(itemId) {
                                               {candidate.status && (
                                                 <span className="item-status">
                                                   {candidate.status}
+                                                </span>
+                                              )}
+                                              {candidateRewardMeta && (
+                                                <span
+                                                  className={`monetary-reward-pill ${candidateRewardMeta.statusClass}`}
+                                                >
+                                                  {candidateRewardMeta.label}
+                                                </span>
+                                              )}
+                                              {candidatePhotos.length > 0 && (
+                                                <span className="photo-count-pill">
+                                                  📷 {candidatePhotos.length}{" "}
+                                                  photo
+                                                  {candidatePhotos.length === 1
+                                                    ? ""
+                                                    : "s"}
                                                 </span>
                                               )}
                                             </div>
@@ -4635,6 +6006,52 @@ async function handleDelete(itemId) {
         </div>
         </div>
       </main>
+
+      {activeLightboxImage && (
+        <div
+          className="photo-lightbox-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Photo preview for ${activeLightboxImage.title}`}
+          onClick={() => setActiveLightboxImage(null)}
+        >
+          <div
+            className="photo-lightbox-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="photo-lightbox-header">
+              <div>
+                <strong>{activeLightboxImage.title}</strong>
+                <span
+                  className={`photo-visibility-badge ${
+                    activeLightboxImage.visibility === "PRIVATE"
+                      ? "private"
+                      : "public"
+                  }`}
+                >
+                  {activeLightboxImage.visibility === "PRIVATE"
+                    ? "PRIVATE EVIDENCE"
+                    : "PUBLIC PHOTO"}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="photo-lightbox-close"
+                aria-label="Close photo preview"
+                onClick={() => setActiveLightboxImage(null)}
+              >
+                ✕ Close
+              </button>
+            </div>
+            <div className="photo-lightbox-body">
+              <img
+                src={activeLightboxImage.url}
+                alt={activeLightboxImage.title}
+              />
+            </div>
+          </div>
+        </div>
+      )}
 
       <footer className="site-footer">
         <div className="site-footer-inner">

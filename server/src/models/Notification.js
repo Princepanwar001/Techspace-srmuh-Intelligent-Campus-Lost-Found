@@ -18,6 +18,8 @@ const notificationSchema = new mongoose.Schema(
         "CLAIM_REJECTED",
         "ITEM_RETURNED",
         "REPORT_MODERATED",
+        "REWARD_SETTLEMENT_PENDING",
+        "REWARD_SETTLED",
       ],
     },
 

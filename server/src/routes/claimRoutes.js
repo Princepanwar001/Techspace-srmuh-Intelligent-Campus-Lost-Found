@@ -7,11 +7,62 @@ import { awardVerifiedReturnXp } from "../utils/rewardEngine.js";
 import {
   notifyClaimReviewed,
   notifyClaimSubmitted,
+  notifyRewardSettlementUpdate,
 } from "../utils/notificationService.js";
 
 const router = express.Router();
 
 const ALLOWED_REVIEW_DECISIONS = ["APPROVED", "REJECTED"];
+
+function sanitizePopulatedItemImages(itemDoc, viewer) {
+  if (!itemDoc || typeof itemDoc !== "object") return itemDoc;
+  const raw =
+    typeof itemDoc.toObject === "function" ? itemDoc.toObject() : { ...itemDoc };
+  const isAdmin = viewer?.role === "admin";
+  const ownerId =
+    raw.reportedBy && typeof raw.reportedBy === "object" && raw.reportedBy._id
+      ? raw.reportedBy._id.toString()
+      : raw.reportedBy
+      ? raw.reportedBy.toString()
+      : null;
+  const isOwner =
+    Boolean(viewer?._id) &&
+    Boolean(ownerId) &&
+    ownerId === viewer._id.toString();
+  const canSeePrivate = isAdmin || isOwner;
+
+  if (Array.isArray(raw.images)) {
+    raw.images = raw.images
+      .filter((img) => img && (canSeePrivate || img.visibility === "PUBLIC"))
+      .map((img) => ({
+        _id: img._id,
+        url: img.url,
+        visibility: img.visibility || "PUBLIC",
+        mimeType: img.mimeType,
+        sizeBytes: img.sizeBytes,
+        createdAt: img.createdAt,
+      }));
+  }
+  return raw;
+}
+
+function sanitizeClaimForViewer(claimDoc, viewer) {
+  if (!claimDoc) return null;
+  const raw =
+    typeof claimDoc.toObject === "function"
+      ? claimDoc.toObject()
+      : { ...claimDoc };
+  if (raw.item && typeof raw.item === "object") {
+    raw.item = sanitizePopulatedItemImages(raw.item, viewer);
+  }
+  if (raw.linkedLostItem && typeof raw.linkedLostItem === "object") {
+    raw.linkedLostItem = sanitizePopulatedItemImages(
+      raw.linkedLostItem,
+      viewer
+    );
+  }
+  return raw;
+}
 
 function logClaimReview({ reviewer, claimId, itemId, decision }) {
   const entry = {
@@ -71,7 +122,7 @@ async function reconcileItemClaimStatus(itemId) {
 // All claim endpoints require authentication
 router.use(requireAuth);
 
-// Submit a claim on an eligible FOUND item
+// Submit a claim on an eligible FOUND item (or a LOST item with an active reward offer)
 router.post("/", async (req, res) => {
   try {
     const body = req.body && typeof req.body === "object" ? req.body : {};
@@ -80,6 +131,10 @@ router.post("/", async (req, res) => {
     const proofDescription =
       typeof body.proofDescription === "string"
         ? body.proofDescription.trim()
+        : "";
+    const rawLinkedLostItemId =
+      body.linkedLostItemId !== undefined && body.linkedLostItemId !== null
+        ? String(body.linkedLostItemId).trim()
         : "";
 
     if (!mongoose.isValidObjectId(itemId)) {
@@ -106,10 +161,13 @@ router.post("/", async (req, res) => {
       });
     }
 
-    if (item.type !== "FOUND") {
+    const isEligibleLostWithReward =
+      item.type === "LOST" && item.rewardStatus === "OFFERED";
+    if (item.type !== "FOUND" && !isEligibleLostWithReward) {
       return res.status(400).json({
         success: false,
-        message: "Only FOUND item reports can be claimed",
+        message:
+          "Only FOUND item reports (or LOST item reports with an active reward offer) can be claimed",
       });
     }
 
@@ -129,6 +187,44 @@ router.post("/", async (req, res) => {
         success: false,
         message: `This report is ${item.status} and is no longer accepting claims`,
       });
+    }
+
+    let linkedLostItemDoc = null;
+    if (rawLinkedLostItemId !== "") {
+      if (item.type !== "FOUND") {
+        return res.status(400).json({
+          success: false,
+          message:
+            "linkedLostItemId can only be attached when claiming a FOUND item",
+        });
+      }
+      if (!mongoose.isValidObjectId(rawLinkedLostItemId)) {
+        return res.status(400).json({
+          success: false,
+          message: "linkedLostItemId must be a valid item ID",
+        });
+      }
+      linkedLostItemDoc = await Item.findById(rawLinkedLostItemId);
+      if (
+        !linkedLostItemDoc ||
+        linkedLostItemDoc.moderated === true ||
+        linkedLostItemDoc.type !== "LOST"
+      ) {
+        return res.status(404).json({
+          success: false,
+          message: "Linked LOST item report not found",
+        });
+      }
+      if (
+        !linkedLostItemDoc.reportedBy ||
+        linkedLostItemDoc.reportedBy.toString() !== req.user._id.toString()
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "You can only link a LOST item report that belongs to your account",
+        });
+      }
     }
 
     // Check for an existing active (PENDING or APPROVED) claim by this student
@@ -164,13 +260,14 @@ router.post("/", async (req, res) => {
       claimant: req.user._id,
       proofDescription,
       status: "PENDING",
+      linkedLostItem: linkedLostItemDoc ? linkedLostItemDoc._id : null,
     });
 
     // Atomically verify the item is still eligible and transition OPEN -> CLAIM_PENDING
     const updatedItem = await Item.findOneAndUpdate(
       {
         _id: item._id,
-        type: "FOUND",
+        type: item.type,
         moderated: { $ne: true },
         status: { $in: ["OPEN", "CLAIM_PENDING"] },
       },
@@ -236,15 +333,23 @@ router.get("/mine", async (req, res) => {
     const claims = await Claim.find({ claimant: req.user._id })
       .populate(
         "item",
-        "_id title category type location itemDate status reportedBy"
+        "_id title category type location itemDate status reportedBy images rewardAmountPaise rewardCurrency rewardStatus rewardSettledAt rewardSettlement"
+      )
+      .populate(
+        "linkedLostItem",
+        "_id title category type location itemDate status reportedBy images rewardAmountPaise rewardCurrency rewardStatus rewardSettledAt rewardSettlement"
       )
       .populate("reviewedBy", "_id name role")
       .sort({ createdAt: -1 });
 
+    const sanitizedClaims = claims.map((c) =>
+      sanitizeClaimForViewer(c, req.user)
+    );
+
     return res.json({
       success: true,
-      count: claims.length,
-      claims,
+      count: sanitizedClaims.length,
+      claims: sanitizedClaims,
     });
   } catch (error) {
     console.error("Fetch my claims error:", error.message);
@@ -310,16 +415,24 @@ router.get("/received", async (req, res) => {
     const claims = await Claim.find(itemFilter)
       .populate(
         "item",
-        "_id title category type location itemDate status reportedBy moderated"
+        "_id title category type location itemDate status reportedBy moderated images rewardAmountPaise rewardCurrency rewardStatus rewardSettledAt rewardSettlement"
+      )
+      .populate(
+        "linkedLostItem",
+        "_id title category type location itemDate status reportedBy moderated images rewardAmountPaise rewardCurrency rewardStatus rewardSettledAt rewardSettlement"
       )
       .populate("claimant", "_id name email")
       .populate("reviewedBy", "_id name role")
       .sort({ createdAt: -1 });
 
+    const sanitizedClaims = claims.map((c) =>
+      sanitizeClaimForViewer(c, req.user)
+    );
+
     return res.json({
       success: true,
-      count: claims.length,
-      claims,
+      count: sanitizedClaims.length,
+      claims: sanitizedClaims,
     });
   } catch (error) {
     console.error("Fetch received claims error:", error.message);
@@ -470,7 +583,14 @@ router.patch("/:id/review", async (req, res) => {
           },
           { returnDocument: "after" }
         )
-          .populate("item", "_id title category type location itemDate status")
+          .populate(
+            "item",
+            "_id title category type location itemDate status rewardAmountPaise rewardCurrency rewardStatus rewardSettledAt rewardSettlement"
+          )
+          .populate(
+            "linkedLostItem",
+            "_id title category type location itemDate status rewardAmountPaise rewardCurrency rewardStatus rewardSettledAt rewardSettlement"
+          )
           .populate("claimant", "_id name email")
           .populate("reviewedBy", "_id name role");
 
@@ -506,6 +626,81 @@ router.patch("/:id/review", async (req, res) => {
               },
             }
           );
+        }
+
+        // Handle voluntary monetary reward settlement transition upon verified return
+        if (
+          lockedItem.type === "LOST" &&
+          lockedItem.rewardStatus === "OFFERED"
+        ) {
+          lockedItem.rewardStatus = "SETTLEMENT_PENDING";
+          lockedItem.rewardSettlement = {
+            linkedClaimId: updatedClaim._id,
+            linkedFoundItemId: null,
+            ownerUserId: lockedItem.reportedBy || req.user._id,
+            finderUserId: claim.claimant,
+            ownerConfirmedAt: null,
+            finderConfirmedAt: null,
+            ownerConfirmedBy: null,
+            finderConfirmedBy: null,
+          };
+          await lockedItem.save();
+          if (updatedClaim.item) {
+            updatedClaim.item.rewardStatus = lockedItem.rewardStatus;
+            updatedClaim.item.rewardSettlement = lockedItem.rewardSettlement;
+          }
+          try {
+            await notifyRewardSettlementUpdate({
+              item: lockedItem,
+              claim: updatedClaim,
+              stage: "SETTLEMENT_PENDING",
+            });
+          } catch (settlementNotifErr) {
+            console.error(
+              "Reward settlement pending notification error:",
+              settlementNotifErr.message
+            );
+          }
+        } else if (lockedItem.type === "FOUND" && claim.linkedLostItem) {
+          const linkedLost = await Item.findById(claim.linkedLostItem);
+          if (linkedLost && !linkedLost.moderated) {
+            linkedLost.status = "RETURNED";
+            if (linkedLost.rewardStatus === "OFFERED") {
+              linkedLost.rewardStatus = "SETTLEMENT_PENDING";
+              linkedLost.rewardSettlement = {
+                linkedClaimId: updatedClaim._id,
+                linkedFoundItemId: lockedItem._id,
+                ownerUserId: linkedLost.reportedBy || claim.claimant,
+                finderUserId: lockedItem.reportedBy || req.user._id,
+                ownerConfirmedAt: null,
+                finderConfirmedAt: null,
+                ownerConfirmedBy: null,
+                finderConfirmedBy: null,
+              };
+            }
+            await linkedLost.save();
+            if (updatedClaim.linkedLostItem) {
+              updatedClaim.linkedLostItem.status = linkedLost.status;
+              updatedClaim.linkedLostItem.rewardStatus =
+                linkedLost.rewardStatus;
+              updatedClaim.linkedLostItem.rewardSettlement =
+                linkedLost.rewardSettlement;
+            }
+            if (linkedLost.rewardStatus === "SETTLEMENT_PENDING") {
+              try {
+                await notifyRewardSettlementUpdate({
+                  item: linkedLost,
+                  claim: updatedClaim,
+                  stage: "SETTLEMENT_PENDING",
+                });
+              } catch (settlementNotifErr) {
+                console.error(
+                  "Linked reward settlement pending notification error:",
+                  settlementNotifErr.message
+                );
+              }
+            }
+          }
         }
 
         logClaimReview({

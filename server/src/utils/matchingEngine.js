@@ -271,7 +271,7 @@ export function scoreItemPair(sourceItem, candidateItem) {
 export function sanitizeMatchedItem(item) {
   const plain =
     (typeof item?.toObject === "function" ? item.toObject() : item) || {};
-  return {
+  const result = {
     _id: plain._id ?? null,
     title: plain.title ?? "",
     description: plain.description ?? "",
@@ -284,6 +284,35 @@ export function sanitizeMatchedItem(item) {
     createdAt: plain.createdAt ?? null,
     updatedAt: plain.updatedAt ?? null,
   };
+
+  if (Array.isArray(plain.images) && plain.images.length > 0) {
+    const publicImages = plain.images
+      .filter((img) => img && img.visibility === "PUBLIC")
+      .map((img) => ({
+        _id: img._id ?? null,
+        url: img.url ?? "",
+        visibility: "PUBLIC",
+        mimeType: img.mimeType ?? "image/jpeg",
+        createdAt: img.createdAt ?? null,
+      }));
+    if (publicImages.length > 0) {
+      result.images = publicImages;
+    }
+  }
+
+  if (
+    (typeof plain.rewardAmountPaise === "number" &&
+      plain.rewardAmountPaise > 0) ||
+    (typeof plain.rewardStatus === "string" &&
+      plain.rewardStatus !== "" &&
+      plain.rewardStatus !== "NONE")
+  ) {
+    result.rewardAmountPaise = plain.rewardAmountPaise ?? 0;
+    result.rewardCurrency = plain.rewardCurrency ?? "INR";
+    result.rewardStatus = plain.rewardStatus ?? "NONE";
+  }
+
+  return result;
 }
 
 export function findMatchesForItem(
